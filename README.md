@@ -11,6 +11,8 @@ A Tony Stark-inspired AI assistant split into two cooperating pieces:
 
 Demo: [Instagram reel](https://www.instagram.com/p/DW2HjYtkwg_/)
 
+[![Demo Video Guide](https://img.youtube.com/vi/mMY9swqe3BI/maxresdefault.jpg)](https://www.youtube.com/watch?v=mMY9swqe3BI)
+
 ---
 
 ## How it works
