@@ -26,6 +26,7 @@ import numpy as np
 import pyaudio
 from dotenv import load_dotenv
 from openwakeword.model import Model as WakeWordModel
+from friday_overlay import FridayOverlay
 
 load_dotenv()
 
@@ -159,9 +160,11 @@ def play_chime():
 async def launcher_loop():
     mcp = MCPServerManager()
     wakeword = WakeWordListener()
+    overlay = FridayOverlay()
 
     mcp.start()
     wakeword.start_stream()
+    overlay.start()
 
     state = State.SLEEPING
     logger.info("FRIDAY launcher ready — say 'Hey Jarvis' to activate")
@@ -178,6 +181,7 @@ async def launcher_loop():
                 )
                 if detected:
                     play_chime()
+                    overlay.show()
                     state = State.ACTIVE
                     logger.info("State → ACTIVE")
 
@@ -196,7 +200,8 @@ async def launcher_loop():
                 except Exception as e:
                     logger.error("Voice session error: %s", e)
 
-                # Resume wake word listening
+                # Hide overlay and resume wake word listening
+                overlay.hide()
                 wakeword.start_stream()
                 state = State.SLEEPING
                 logger.info("State → SLEEPING")
@@ -204,6 +209,7 @@ async def launcher_loop():
     except KeyboardInterrupt:
         logger.info("Shutting down...")
     finally:
+        overlay.stop()
         wakeword.cleanup()
         mcp.stop()
         logger.info("FRIDAY launcher stopped")
