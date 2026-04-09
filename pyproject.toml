@@ -10,11 +10,15 @@ dependencies = [
     "livekit-agents[deepgram,groq,openai,sarvam,silero]>=1.5.1",
     "livekit-plugins-google>=1.5.1",
     "python-dotenv",
+    "openwakeword",
+    "pyaudio",
+    "livekit-api",
 ]
 
 [project.scripts]
 friday = "server:main"
-friday_voice = "agent_friday:dev" # Points to the wrapper
+friday_voice = "agent_friday:dev"
+friday_start = "friday_launcher:main"
 
 [build-system]
 requires = ["hatchling"]
