@@ -68,7 +68,7 @@ class MCPServerManager:
             return
         logger.info("Starting MCP server...")
         self._proc = subprocess.Popen(
-            [sys.executable, "-m", "uv", "run", "friday"],
+            [sys.executable, str(Path(__file__).parent / "server.py")],
             cwd=Path(__file__).parent,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -77,7 +77,8 @@ class MCPServerManager:
 
     def ensure_alive(self):
         if self._proc is None or self._proc.poll() is not None:
-            logger.warning("MCP server died, restarting...")
+            if self._proc is not None:
+                logger.warning("MCP server died, restarting...")
             self.start()
 
     def stop(self):
