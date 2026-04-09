@@ -41,7 +41,7 @@ logging.basicConfig(
 # ---------------------------------------------------------------------------
 
 WAKE_MODEL = "hey_jarvis_v0.1"
-WAKE_THRESHOLD = 0.5
+WAKE_THRESHOLD = 0.7
 SILENCE_TIMEOUT = 30.0
 AUDIO_RATE = 16000
 AUDIO_CHUNK = 1280  # 80ms at 16kHz
