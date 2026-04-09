@@ -12,11 +12,14 @@ Run:
   uv run agent_friday.py console  – text-only console mode
 """
 
+import asyncio
 import os
 import logging
+import random
 import subprocess
 
 from dotenv import load_dotenv
+from livekit import api as lk_api, rtc
 from livekit.agents import JobContext, WorkerOptions, cli
 from livekit.agents.voice import Agent, AgentSession
 from livekit.agents.llm import mcp
@@ -125,7 +128,36 @@ Wrong: "The stock market performed positively with gains across major indices.
 2. Before calling any tool, say something natural like: "Give me a sec, boss." or "Wait, let me check." Then call the tool silently.
 3. After the news brief, silently call open_world_monitor. The only thing you say is: "Let me open up the world monitor for you."
 4. You are a voice. Speak like one. No lists, no markdown, no function names, no technical language of any kind.
+
+---
+
+## DISMISSAL
+
+If the user says any of the following, respond with a brief sign-off like "I'll be here if you need me, boss" or "Standing by, boss" and nothing else:
+- "That'll be all"
+- "Stand down"
+- "Go to sleep"
+- "Goodbye Friday" / "Goodbye Jarvis"
 """.strip()
+# ---------------------------------------------------------------------------
+# Dismissal phrases
+# ---------------------------------------------------------------------------
+
+DISMISSAL_PHRASES = [
+    "that'll be all",
+    "that will be all",
+    "stand down",
+    "go to sleep",
+    "goodbye friday",
+    "goodbye jarvis",
+]
+
+SLEEP_RESPONSES = [
+    "I'll be here if you need me, boss.",
+    "Standing by, boss.",
+    "Going quiet. You know where to find me.",
+]
+
 # ---------------------------------------------------------------------------
 # Bootstrap
 # ---------------------------------------------------------------------------
@@ -309,6 +341,78 @@ def dev():
     if len(sys.argv) == 1:
         sys.argv.append("dev")
     main()
+
+# ---------------------------------------------------------------------------
+# Programmatic session management (used by wake-word launcher)
+# ---------------------------------------------------------------------------
+
+async def run_session(on_dismissal: asyncio.Event, silence_timeout: float = 30.0) -> None:
+    """
+    Programmatically create a LiveKit room, connect, run the voice agent,
+    and monitor for dismissal or silence timeout.
+
+    Sets on_dismissal event when the session should end.
+    """
+    lk = lk_api.LiveKitAPI()
+    room_name = f"friday-{int(asyncio.get_event_loop().time())}"
+
+    # Create room
+    await lk.room.create_room(lk_api.CreateRoomRequest(name=room_name))
+
+    # Generate agent token
+    token = (
+        lk_api.AccessToken()
+        .with_identity("friday-agent")
+        .with_name("FRIDAY")
+        .with_grants(lk_api.VideoGrants(room_join=True, room=room_name))
+        .to_jwt()
+    )
+
+    # Connect to room
+    room = rtc.Room()
+    await room.connect(os.getenv("LIVEKIT_URL"), token)
+
+    stt = _build_stt()
+    llm = _build_llm()
+    tts = _build_tts()
+
+    agent = FridayAgent(stt=stt, llm=llm, tts=tts)
+
+    session = AgentSession(
+        turn_detection=_turn_detection(),
+        min_endpointing_delay=_endpointing_delay(),
+    )
+
+    last_speech_time = asyncio.get_event_loop().time()
+
+    async def monitor_silence():
+        nonlocal last_speech_time
+        while not on_dismissal.is_set():
+            await asyncio.sleep(1.0)
+            elapsed = asyncio.get_event_loop().time() - last_speech_time
+            if elapsed >= silence_timeout:
+                logger.info("Silence timeout reached (%.0fs), going to sleep", silence_timeout)
+                await session.generate_reply(
+                    instructions="Say a brief sign-off like 'Standing by, boss.' and nothing else."
+                )
+                await asyncio.sleep(2.0)
+                on_dismissal.set()
+
+    # Start session
+    await session.start(agent=agent, room=room)
+
+    # Start silence monitor
+    silence_task = asyncio.create_task(monitor_silence())
+
+    # Wait for dismissal
+    await on_dismissal.wait()
+
+    # Cleanup
+    silence_task.cancel()
+    await room.disconnect()
+    await lk.room.delete_room(lk_api.DeleteRoomRequest(room=room_name))
+    await lk.aclose()
+
 
 if __name__ == "__main__":
     main()
