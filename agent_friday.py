@@ -18,6 +18,7 @@ import logging
 import random
 import subprocess
 
+import aiohttp
 from dotenv import load_dotenv
 from livekit import api as lk_api, rtc
 from livekit.agents import JobContext, WorkerOptions, cli
@@ -214,7 +215,7 @@ def _mcp_server_url() -> str:
 # Build provider instances
 # ---------------------------------------------------------------------------
 
-def _build_stt():
+def _build_stt(http_session=None):
     if STT_PROVIDER == "sarvam":
         logger.info("STT → Sarvam Saaras v3")
         return sarvam.STT(
@@ -223,6 +224,7 @@ def _build_stt():
             mode="transcribe",
             flush_signal=True,
             sample_rate=16000,
+            http_session=http_session,
         )
     elif STT_PROVIDER == "whisper":
         logger.info("STT → OpenAI Whisper")
@@ -242,7 +244,7 @@ def _build_llm():
         raise ValueError(f"Unknown LLM_PROVIDER: {LLM_PROVIDER!r}")
 
 
-def _build_tts():
+def _build_tts(http_session=None):
     if TTS_PROVIDER == "sarvam":
         logger.info("TTS → Sarvam Bulbul v3")
         return sarvam.TTS(
@@ -250,6 +252,7 @@ def _build_tts():
             model="bulbul:v3",
             speaker=SARVAM_TTS_SPEAKER,
             pace=TTS_SPEED,
+            http_session=http_session,
         )
     elif TTS_PROVIDER == "openai":
         logger.info("TTS → OpenAI TTS (%s / %s)", OPENAI_TTS_MODEL, OPENAI_TTS_VOICE)
@@ -359,6 +362,8 @@ async def run_session(on_dismissal: asyncio.Event, silence_timeout: float = 30.0
 
     Sets on_dismissal event when the session should end.
     """
+    http_session = aiohttp.ClientSession()
+
     lk = lk_api.LiveKitAPI()
     room_name = f"friday-{int(asyncio.get_event_loop().time())}"
 
@@ -378,9 +383,9 @@ async def run_session(on_dismissal: asyncio.Event, silence_timeout: float = 30.0
     room = rtc.Room()
     await room.connect(os.getenv("LIVEKIT_URL"), token)
 
-    stt = _build_stt()
+    stt = _build_stt(http_session=http_session)
     llm = _build_llm()
-    tts = _build_tts()
+    tts = _build_tts(http_session=http_session)
 
     agent = FridayAgent(stt=stt, llm=llm, tts=tts)
 
@@ -418,6 +423,7 @@ async def run_session(on_dismissal: asyncio.Event, silence_timeout: float = 30.0
     await room.disconnect()
     await lk.room.delete_room(lk_api.DeleteRoomRequest(room=room_name))
     await lk.aclose()
+    await http_session.close()
 
 
 if __name__ == "__main__":
