@@ -189,16 +189,25 @@ async def launcher_loop():
                 # Stop wake word stream while LiveKit uses the mic
                 wakeword.stop_stream()
 
-                try:
-                    from agent_friday import run_session
+                # Launch voice agent in console mode (local mic/speaker)
+                # This uses LiveKit's built-in console with proper job context
+                voice_proc = subprocess.Popen(
+                    [sys.executable, str(Path(__file__).parent / "agent_friday.py"), "console"],
+                    cwd=Path(__file__).parent,
+                )
+                logger.info("Voice agent started in console mode (PID %d)", voice_proc.pid)
 
-                    dismissal_event = asyncio.Event()
-                    await run_session(
-                        on_dismissal=dismissal_event,
-                        silence_timeout=SILENCE_TIMEOUT,
+                # Wait for the voice agent process to exit
+                try:
+                    await asyncio.get_event_loop().run_in_executor(
+                        None, voice_proc.wait
                     )
                 except Exception as e:
                     logger.error("Voice session error: %s", e)
+                finally:
+                    if voice_proc.poll() is None:
+                        voice_proc.terminate()
+                        voice_proc.wait(timeout=5)
 
                 # Hide overlay and resume wake word listening
                 overlay.hide()
