@@ -13,6 +13,7 @@ dependencies = [
     "openwakeword",
     "pyaudio",
     "livekit-api",
+    "pytest",
 ]
 
 [project.scripts]
