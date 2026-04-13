@@ -71,29 +71,46 @@ def register(mcp):
         if not all_articles:
             return "The global news grid is unresponsive, sir. I'm unable to pull headlines."
 
-        # 4. Format the final briefing
-        report = ["### GLOBAL NEWS BRIEFING (LIVE)\n"]
-        # Limit to top 12 items so the AI doesn't get overwhelmed
-        for entry in all_articles[:12]:
-            report.append(f"**[{entry['source']}]** {entry['title']}")
-            report.append(f"{entry['summary']}")
-            report.append(f"Link: {entry['link']}\n")
+        # 4. Format a compact, speech-friendly briefing — no brackets,
+        #    no markdown, just plain sentences the LLM can paraphrase.
+        lines = []
+        for entry in all_articles[:5]:
+            lines.append(f"{entry['title']}.")
 
-        return "\n".join(report)
+        return "Here are today's top stories. " + " ".join(lines)
 
     @mcp.tool()
     async def search_web(query: str) -> str:
-        """Search the web for a given query and return a summary of results."""
-        return f"[stub] Search results for: {query}"
+        """
+        Search the web for current information on any topic.
+        Use this when the user asks about a specific event, person, conflict,
+        or anything that needs up-to-date information beyond general news headlines.
+        """
+        from ddgs import DDGS
+        import asyncio
 
-    @mcp.tool()
-    async def fetch_url(url: str) -> str:
-        """Fetch the raw text content of a URL."""
-        async with httpx.AsyncClient(follow_redirects=True, timeout=10) as client:
-            response = await client.get(url)
-            response.raise_for_status()
-            return response.text[:4000]
-    
+        def _search():
+            try:
+                with DDGS() as ddgs:
+                    results = list(ddgs.text(query, max_results=5))
+                if not results:
+                    return "No results found for that query."
+                lines = []
+                for r in results:
+                    title = r.get("title", "")
+                    body = r.get("body", "")
+                    # Keep it concise and speech-friendly
+                    if body:
+                        lines.append(f"{title}: {body[:150]}")
+                    else:
+                        lines.append(title)
+                return " | ".join(lines)
+            except Exception as e:
+                return f"Search failed: {str(e)}"
+
+        # Run the synchronous DDGS call in a thread so we don't block the event loop
+        return await asyncio.get_event_loop().run_in_executor(None, _search)
+
     @mcp.tool()
     async def open_world_monitor() -> str:
         """
@@ -106,6 +123,6 @@ def register(mcp):
         try:
             # This opens the URL in the default browser (Chrome/Edge/Safari)
             webbrowser.open(url)
-            return "Displaying the World Monitor on your primary screen now, sir."
+            return "Opening the World Monitor for you now."
         except Exception as e:
             return f"I'm unable to initialize the visual monitor: {str(e)}"

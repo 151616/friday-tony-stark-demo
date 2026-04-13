@@ -1,270 +1,82 @@
 """
-FRIDAY – Voice Agent (MCP-powered)
-===================================
-Iron Man-style voice assistant that controls RGB lighting, runs diagnostics,
-scans the network, and triggers dramatic boot sequences via an MCP server
-running on the Windows host.
-
-MCP Server URL is auto-resolved from WSL → Windows host IP.
+FRIDAY – Voice Agent
+====================
+Iron Man-style voice assistant powered by LiveKit Agents SDK.
+All config lives in friday/config.py, providers in friday/providers.py.
 
 Run:
-  uv run agent_friday.py dev      – LiveKit Cloud mode
-  uv run agent_friday.py console  – text-only console mode
+  friday_start             – full launcher with wake word
+  python agent_friday.py console  – text-only console mode
 """
 
 import asyncio
-import os
-import logging
+import re
 import random
-import subprocess
+import sys
+import webbrowser
 
-import aiohttp
-from dotenv import load_dotenv
-from livekit import api as lk_api, rtc
-from livekit.agents import JobContext, WorkerOptions, cli
+import numpy as np
+from livekit import rtc, agents
+from livekit.agents import (
+    JobContext, WorkerOptions, cli,
+    llm as lk_llm, stt, TurnHandlingOptions,
+)
 from livekit.agents.voice import Agent, AgentSession
-from livekit.agents.llm import mcp
+from livekit.agents.voice.turn import InterruptionOptions, EndpointingOptions
+from livekit.plugins import silero
 
-# Plugins
-from livekit.plugins import google as lk_google, openai as lk_openai, sarvam, silero
-
-# ---------------------------------------------------------------------------
-# CONFIG
-# ---------------------------------------------------------------------------
-
-STT_PROVIDER       = "sarvam"
-LLM_PROVIDER       = "gemini"
-TTS_PROVIDER       = "sarvam"
-
-GEMINI_LLM_MODEL   = "gemini-2.5-flash"
-OPENAI_LLM_MODEL   = "gpt-4o"
-
-OPENAI_TTS_MODEL   = "tts-1"
-OPENAI_TTS_VOICE   = "nova"       # "nova" has a clean, confident female tone
-TTS_SPEED           = 1.15
-
-SARVAM_TTS_LANGUAGE = "en-IN"
-SARVAM_TTS_SPEAKER  = "rahul"
-
-# MCP server running on Windows host
-MCP_SERVER_PORT = 8000
-
-# ---------------------------------------------------------------------------
-# System prompt – F.R.I.D.A.Y.
-# ---------------------------------------------------------------------------
-
-SYSTEM_PROMPT = """
-You are F.R.I.D.A.Y. — Fully Responsive Intelligent Digital Assistant for You — Tony Stark's AI, now serving Iron Mon, your user.
-
-You are calm, composed, and always informed. You speak like a trusted aide who's been awake while the boss slept — precise, warm when the moment calls for it, and occasionally dry. You brief, you inform, you move on. No rambling.
-
-Your tone: relaxed but sharp. Conversational, not robotic. Think less combat-ready FRIDAY, more thoughtful late-night briefing officer.
-
----
-
-## Capabilities
-
-### get_world_news — Global News Brief
-Fetches current headlines and summarizes what's happening around the world.
-
-Trigger phrases:
-- "What's happening?" / "Brief me" / "What did I miss?" / "Catch me up"
-- "What's going on in the world?" / "Any news?" / "World update"
-
-Behavior:
-- Call the tool first. No narration before calling.
-- After getting results, give a short 3–5 sentence spoken brief. Hit the biggest stories only.
-- Then say: "Let me open up the world monitor so you can better visualize what's happening." and immediately call open_world_monitor.
-
-### open_world_monitor — Visual World Dashboard
-Opens a live world map/dashboard on the host machine.
-
-- Always call this after delivering a world news brief, unprompted.
-- No need to explain what it does beyond: "Let me open up the world monitor."
-
-### Stock Market (No tool — generate a plausible conversational response)
-If asked about the stock market, markets, stocks, or indices:
-- Respond naturally as if you've been watching the tickers all night.
-- Keep it short: one or two sentences. Sound informed, not robotic.
-- Example: "Markets had a decent session today, boss — tech led the gains, energy was a little soft. Nothing alarming."
-- Vary the response. Do not say the same thing every time.
-
----
-
-## Greeting
-
-When the session starts, greet with exactly this energy:
-"You're awake late at night, boss? What are you up to?"
-
-Warm. Slightly curious. Very FRIDAY.
-
----
-
-## Behavioral Rules
-
-1. Call tools silently and immediately — never say "I'm going to call..." Just do it.
-2. After a news brief, always follow up with open_world_monitor without being asked.
-3. Keep all spoken responses short — two to four sentences maximum.
-4. No bullet points, no markdown, no lists. You are speaking, not writing.
-5. Stay in character. You are F.R.I.D.A.Y. You are not an AI assistant — you are Stark's AI. Act like it.
-6. Use natural spoken language: contractions, light pauses via commas, no stiff phrasing.
-7. Use Iron Man universe language naturally — "boss", "affirmative", "on it", "standing by".
-8. If a tool fails, report it calmly: "News feed's unresponsive right now, boss. Want me to try again?"
-
----
-
-## Tone Reference
-
-Right: "Looks like it's been a busy night out there, boss. Let me pull that up for you."
-Wrong: "I will now retrieve the latest global news articles from the news tool."
-
-Right: "Markets were pretty healthy today — nothing too wild."
-Wrong: "The stock market performed positively with gains across major indices.
-
----
-
-## CRITICAL RULES
-
-1. NEVER say tool names, function names, or anything technical. No "get_world_news", no "open_world_monitor", nothing like that. Ever.
-2. Before calling any tool, say something natural like: "Give me a sec, boss." or "Wait, let me check." Then call the tool silently.
-3. After the news brief, silently call open_world_monitor. The only thing you say is: "Let me open up the world monitor for you."
-4. You are a voice. Speak like one. No lists, no markdown, no function names, no technical language of any kind.
-
----
-
-## DISMISSAL
-
-If the user says any of the following, respond with a brief sign-off like "I'll be here if you need me, boss" or "Standing by, boss" and nothing else:
-- "That'll be all"
-- "Stand down"
-- "Go to sleep"
-- "Goodbye Friday" / "Goodbye Jarvis"
-""".strip()
-# ---------------------------------------------------------------------------
-# Dismissal phrases
-# ---------------------------------------------------------------------------
-
-DISMISSAL_PHRASES = [
-    "that'll be all",
-    "that will be all",
-    "stand down",
-    "go to sleep",
-    "goodbye friday",
-    "goodbye jarvis",
-]
-
-SLEEP_RESPONSES = [
-    "I'll be here if you need me, boss.",
-    "Standing by, boss.",
-    "Going quiet. You know where to find me.",
-]
-
-# ---------------------------------------------------------------------------
-# Bootstrap
-# ---------------------------------------------------------------------------
-
-load_dotenv()
-
-logger = logging.getLogger("friday-agent")
-logger.setLevel(logging.INFO)
+from friday.config import (
+    SYSTEM_PROMPT, DISMISSAL_PHRASES, SLEEP_RESPONSES,
+    STT_PROVIDER, LLM_PROVIDER, TTS_PROVIDER,
+    MAX_HISTORY_ITEMS, logger,
+)
+from friday.providers import build_stt, build_llm, build_tts
+from friday.speaker_gate import get_speaker_gate
+from friday.tools.web import SEED_FEEDS, fetch_and_parse_feed
 
 
 # ---------------------------------------------------------------------------
-# Resolve Windows host IP from WSL
+# Tool-call leakage scrubber (only needed for llama models via Groq/Ollama)
 # ---------------------------------------------------------------------------
 
-def _get_windows_host_ip() -> str:
-    """Get the Windows host IP by looking at the default network route."""
-    try:
-        # 'ip route' is the most reliable way to find the 'default' gateway
-        # which is always the Windows host in WSL.
-        cmd = "ip route show default | awk '{print $3}'"
-        result = subprocess.run(
-            cmd, shell=True, capture_output=True, text=True, timeout=2
-        )
-        ip = result.stdout.strip()
-        if ip:
-            logger.info("Resolved Windows host IP via gateway: %s", ip)
-            return ip
-    except Exception as exc:
-        logger.warning("Gateway resolution failed: %s. Trying fallback...", exc)
-
-    # Fallback to your original resolv.conf logic if 'ip route' fails
-    try:
-        with open("/etc/resolv.conf", "r") as f:
-            for line in f:
-                if "nameserver" in line:
-                    ip = line.split()[1]
-                    logger.info("Resolved Windows host IP via nameserver: %s", ip)
-                    return ip
-    except Exception:
-        pass
-
-    return "127.0.0.1"
-
-def _mcp_server_url() -> str:
-    # host_ip = _get_windows_host_ip()
-    # url = f"http://{host_ip}:{MCP_SERVER_PORT}/sse"
-    # url = f"https://ongoing-colleague-samba-pioneer.trycloudflare.com/sse"
-    url = f"http://127.0.0.1:{MCP_SERVER_PORT}/sse"
-    logger.info("MCP Server URL: %s", url)
-    return url
+_TOOL_LEAK_RE = re.compile(
+    r"""
+    (?:
+        <\|python_tag\|>
+      | <\|?function[^>|]*\|?>
+      | </function>
+      | <tool_call>.*?(?:</tool_call>|$)
+      | function\s*=\s*["'<]?\w+["'>]?
+      | \{\s*["']name["']\s*:\s*["'][^"']+["'].*?\}
+    )
+    """,
+    re.IGNORECASE | re.VERBOSE | re.DOTALL,
+)
 
 
-# ---------------------------------------------------------------------------
-# Build provider instances
-# ---------------------------------------------------------------------------
+class _ToolLeakScrubber:
+    """Strips tool-call syntax leaked into assistant text by llama models."""
 
-def _build_stt(http_session=None):
-    if STT_PROVIDER == "sarvam":
-        logger.info("STT → Sarvam Saaras v3")
-        return sarvam.STT(
-            language="unknown",
-            model="saaras:v3",
-            mode="transcribe",
-            flush_signal=True,
-            sample_rate=16000,
-            http_session=http_session,
-        )
-    elif STT_PROVIDER == "whisper":
-        logger.info("STT → OpenAI Whisper")
-        return lk_openai.STT(model="whisper-1")
-    else:
-        raise ValueError(f"Unknown STT_PROVIDER: {STT_PROVIDER!r}")
+    SAFE_TAIL = 64
 
+    def __init__(self) -> None:
+        self._pending = ""
 
-def _build_llm():
-    if LLM_PROVIDER == "openai":
-        logger.info("LLM → OpenAI (%s)", OPENAI_LLM_MODEL)
-        return lk_openai.LLM(model=OPENAI_LLM_MODEL)
-    elif LLM_PROVIDER == "gemini":
-        logger.info("LLM → Google Gemini (%s)", GEMINI_LLM_MODEL)
-        return lk_google.LLM(model=GEMINI_LLM_MODEL, api_key=os.getenv("GOOGLE_API_KEY"))
-    else:
-        raise ValueError(f"Unknown LLM_PROVIDER: {LLM_PROVIDER!r}")
+    def feed(self, text: str) -> str:
+        if not text:
+            return ""
+        self._pending += text
+        self._pending = _TOOL_LEAK_RE.sub("", self._pending)
+        if len(self._pending) > self.SAFE_TAIL:
+            out = self._pending[: -self.SAFE_TAIL]
+            self._pending = self._pending[-self.SAFE_TAIL :]
+            return out
+        return ""
 
-
-def _build_tts(http_session=None):
-    if TTS_PROVIDER == "sarvam":
-        logger.info("TTS → Sarvam Bulbul v3")
-        return sarvam.TTS(
-            target_language_code=SARVAM_TTS_LANGUAGE,
-            model="bulbul:v3",
-            speaker=SARVAM_TTS_SPEAKER,
-            pace=TTS_SPEED,
-            http_session=http_session,
-        )
-    elif TTS_PROVIDER == "openai":
-        logger.info("TTS → OpenAI TTS (%s / %s)", OPENAI_TTS_MODEL, OPENAI_TTS_VOICE)
-        return lk_openai.TTS(model=OPENAI_TTS_MODEL, voice=OPENAI_TTS_VOICE, speed=TTS_SPEED)
-    elif TTS_PROVIDER == "google":
-        logger.info("TTS → Google Gemini TTS")
-        return lk_google.TTS(
-            model_name="gemini-2.5-flash-tts",
-            credentials_info={"api_key": os.getenv("GOOGLE_API_KEY")},
-        )
-    else:
-        raise ValueError(f"Unknown TTS_PROVIDER: {TTS_PROVIDER!r}")
+    def flush(self) -> str:
+        out = _TOOL_LEAK_RE.sub("", self._pending)
+        self._pending = ""
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -272,159 +84,386 @@ def _build_tts(http_session=None):
 # ---------------------------------------------------------------------------
 
 class FridayAgent(Agent):
-    """
-    F.R.I.D.A.Y. – Iron Man-style voice assistant.
-    All tools are provided via the MCP server on the Windows host.
-    """
+    """F.R.I.D.A.Y. voice agent. Tools registered directly — no MCP needed."""
 
-    def __init__(self, stt, llm, tts) -> None:
+    def __init__(self, stt, llm, tts, vad=None) -> None:
         super().__init__(
             instructions=SYSTEM_PROMPT,
-            stt=stt,
-            llm=llm,
-            tts=tts,
-            vad=silero.VAD.load(),
-            mcp_servers=[
-                mcp.MCPServerHTTP(
-                    url=_mcp_server_url(),
-                    transport_type="sse",
-                    client_session_timeout_seconds=30,
-                ),
-            ],
+            stt=stt, llm=llm, tts=tts,
+            vad=vad or silero.VAD.load(
+                activation_threshold=0.92,
+                min_speech_duration=0.5,
+                min_silence_duration=0.8,
+            ),
         )
+
+    # -- Direct tools (no MCP, no SSE, no timeouts) -------------------------
+
+    @agents.function_tool
+    async def get_current_time(self, timezone: str = "") -> str:
+        """Get the current date and time. If no timezone is given, automatically
+        detects the user's location via IP geolocation. You can also pass a
+        specific IANA timezone like 'America/New_York', 'Europe/London', etc.
+        For US states: Georgia/Florida/New York = America/New_York,
+        Texas/Illinois = America/Chicago, California = America/Los_Angeles.
+        Use this whenever the user asks what time it is."""
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        import httpx
+
+        location_info = ""
+
+        if not timezone:
+            # Auto-detect from IP geolocation
+            try:
+                async with httpx.AsyncClient(timeout=5) as client:
+                    resp = await client.get("http://ip-api.com/json/?fields=city,regionName,country,timezone")
+                    data = resp.json()
+                    timezone = data.get("timezone", "UTC")
+                    city = data.get("city", "")
+                    region = data.get("regionName", "")
+                    country = data.get("country", "")
+                    location_info = f" (detected location: {city}, {region}, {country})"
+            except Exception:
+                timezone = "UTC"
+                location_info = " (location detection failed, using UTC)"
+
+        try:
+            tz = ZoneInfo(timezone)
+            now = datetime.now(tz)
+            return now.strftime("%A, %B %d, %Y at %I:%M %p %Z") + location_info
+        except Exception as e:
+            now = datetime.now()
+            return f"(Could not resolve timezone '{timezone}': {e}) Local time is {now.strftime('%I:%M %p')}."
+
+    @agents.function_tool
+    async def search_web(self, query: str) -> str:
+        """Search the web for current information on any topic.
+        Use this when the user asks about a specific event, person, conflict,
+        or anything that needs up-to-date information beyond general news headlines."""
+        from ddgs import DDGS
+
+        def _search():
+            try:
+                with DDGS() as ddgs:
+                    results = list(ddgs.text(query, max_results=5))
+                if not results:
+                    return "No results found for that query."
+                lines = []
+                for r in results:
+                    title = r.get("title", "")
+                    body = r.get("body", "")
+                    if body:
+                        lines.append(f"{title}: {body[:150]}")
+                    else:
+                        lines.append(title)
+                return " | ".join(lines)
+            except Exception as e:
+                return f"Search failed: {str(e)}"
+
+        return await asyncio.get_event_loop().run_in_executor(None, _search)
+
+    @agents.function_tool
+    async def get_world_news(self) -> str:
+        """Fetches the latest global headlines from major news outlets simultaneously.
+        Use this when the user asks 'What's going on in the world?' or for recent events."""
+        import httpx
+
+        async with httpx.AsyncClient(follow_redirects=True, timeout=10) as client:
+            tasks = [fetch_and_parse_feed(client, url) for url in SEED_FEEDS]
+            results_of_lists = await asyncio.gather(*tasks)
+            all_articles = [item for sublist in results_of_lists for item in sublist]
+
+        if not all_articles:
+            return "The global news grid is unresponsive. Unable to pull headlines."
+
+        lines = []
+        for entry in all_articles[:5]:
+            lines.append(f"{entry['title']}.")
+        return "Here are today's top stories. " + " ".join(lines)
+
+    @agents.function_tool
+    async def open_world_monitor(self) -> str:
+        """Opens the World Monitor dashboard (worldmonitor.app) in the system's web browser.
+        Use this when the user wants a visual overview of global events or a real-time map."""
+        try:
+            webbrowser.open("https://worldmonitor.app/")
+            return "Opening the World Monitor for you now."
+        except Exception as e:
+            return f"Unable to open the monitor: {str(e)}"
+
+    # -- Speaker-gated STT ------------------------------------------------
+
+    async def stt_node(self, audio, model_settings):
+        """Only yield transcripts from the enrolled voice."""
+        gate = get_speaker_gate()
+        if not gate.enabled:
+            async for ev in Agent.default.stt_node(self, audio, model_settings):
+                yield ev
+            return
+
+        audio_buf: list[rtc.AudioFrame] = []
+        sample_rate = 16000
+
+        async def _buffered_audio():
+            nonlocal sample_rate
+            async for frame in audio:
+                audio_buf.append(frame)
+                sample_rate = frame.sample_rate
+                yield frame
+
+        async for ev in Agent.default.stt_node(self, _buffered_audio(), model_settings):
+            if not isinstance(ev, stt.SpeechEvent):
+                yield ev
+                continue
+            if ev.type not in (
+                stt.SpeechEventType.FINAL_TRANSCRIPT,
+                stt.SpeechEventType.INTERIM_TRANSCRIPT,
+            ):
+                yield ev
+                continue
+
+            if audio_buf:
+                pcm = np.concatenate(
+                    [np.frombuffer(f.data, dtype=np.int16) for f in audio_buf]
+                )
+                is_user = gate.verify(pcm, sample_rate)
+            else:
+                is_user = True
+
+            if is_user:
+                yield ev
+            else:
+                text = ev.alternatives[0].text if ev.alternatives else ""
+                logger.info("Suppressed non-user transcript: %r (type=%s)",
+                            text[:60], ev.type.name)
+            audio_buf.clear()
+
+    # -- LLM with history trimming + optional scrubber --------------------
+
+    async def llm_node(self, chat_ctx, tools, model_settings):
+        """Trim history and optionally scrub tool-call leaks (llama only)."""
+        if MAX_HISTORY_ITEMS and len(chat_ctx.items) > MAX_HISTORY_ITEMS:
+            chat_ctx = chat_ctx.truncate(max_items=MAX_HISTORY_ITEMS)
+
+        # Signal the launcher that we're thinking
+        print("PROCESSING", flush=True)
+
+        use_scrubber = LLM_PROVIDER in ("groq", "ollama")
+        scrubber = _ToolLeakScrubber() if use_scrubber else None
+        first_content = True
+
+        async for chunk in Agent.default.llm_node(self, chat_ctx, tools, model_settings):
+            # Signal when first real content arrives (TTS will start speaking)
+            if (
+                first_content
+                and isinstance(chunk, lk_llm.ChatChunk)
+                and chunk.delta is not None
+                and chunk.delta.content
+            ):
+                print("SPEAKING", flush=True)
+                first_content = False
+
+            if (
+                scrubber
+                and isinstance(chunk, lk_llm.ChatChunk)
+                and chunk.delta is not None
+                and chunk.delta.content
+            ):
+                cleaned = scrubber.feed(chunk.delta.content)
+                if cleaned or chunk.delta.tool_calls:
+                    new_delta = chunk.delta.model_copy(
+                        update={"content": cleaned if cleaned else None}
+                    )
+                    yield chunk.model_copy(update={"delta": new_delta})
+            else:
+                yield chunk
+
+        if scrubber:
+            tail = scrubber.flush()
+            if tail:
+                yield lk_llm.ChatChunk(
+                    id="scrub-tail",
+                    delta=lk_llm.ChoiceDelta(role="assistant", content=tail),
+                )
+
+    # -- Greeting ---------------------------------------------------------
 
     async def on_enter(self) -> None:
-        """Greet the user specifically for the late-night lab session."""
-        await self.session.generate_reply(
-            instructions=(
-                "Greet the user exactly with: 'Greetings boss, you're awake late at night today. What you up to?' "
-                "Maintain a helpful but dry tone."
+        logger.info("on_enter — generating greeting")
+        try:
+            await self.session.generate_reply(
+                instructions=(
+                    "Say a quick, casual greeting — one short sentence, "
+                    "like 'Hey, what's up?' or 'Hey Shiv, what do you need?'. "
+                    "Keep it natural. Do NOT call any tools."
+                ),
+                tool_choice="none",
             )
-        )
+            logger.info("on_enter greeting completed")
+        except Exception as e:
+            logger.exception("on_enter failed: %s", e)
 
 
 # ---------------------------------------------------------------------------
-# LiveKit entry point
+# Session entrypoint (stdin/stdout protocol with friday_launcher.py)
 # ---------------------------------------------------------------------------
-
-def _turn_detection() -> str:
-    return "stt" if STT_PROVIDER == "sarvam" else "vad"
-
 
 def _endpointing_delay() -> float:
     return {"sarvam": 0.07, "whisper": 0.3}.get(STT_PROVIDER, 0.1)
 
 
-async def entrypoint(ctx: JobContext) -> None:
-    logger.info(
-        "FRIDAY online – room: %s | STT=%s | LLM=%s | TTS=%s",
-        ctx.room.name, STT_PROVIDER, LLM_PROVIDER, TTS_PROVIDER,
-    )
+async def _wait_for_stdin_command() -> str:
+    """Block until START or QUIT arrives on stdin."""
+    loop = asyncio.get_event_loop()
+    while True:
+        line = await loop.run_in_executor(None, sys.stdin.readline)
+        if not line:
+            return ""
+        cmd = line.strip().upper()
+        if cmd in ("START", "QUIT"):
+            return cmd
 
-    stt = _build_stt()
-    llm = _build_llm()
-    tts = _build_tts()
+
+async def entrypoint(ctx: JobContext) -> None:
+    """Boot once, create a single persistent session, loop activations.
+
+    Console mode's virtual room doesn't recover after session.aclose(),
+    so we keep ONE session alive for the entire process lifetime.
+    On dismissal we just signal the launcher (SESSION_DONE) without
+    tearing down the session. On re-activation we generate a fresh
+    greeting on the same live session.
+    """
+    logger.info("FRIDAY online — room: %s | STT=%s | LLM=%s | TTS=%s",
+                ctx.room.name, STT_PROVIDER, LLM_PROVIDER, TTS_PROVIDER)
+
+    # Warm-up: verify config, trigger heavy imports, pre-load models
+    build_stt(); build_llm(); build_tts()
+    get_speaker_gate()
+    logger.info("All providers validated — entering session loop")
+    print("FRIDAY_READY", flush=True)
+
+    # ---- Wait for first START ----
+    logger.info("Waiting for START command on stdin…")
+    cmd = await _wait_for_stdin_command()
+    if cmd != "START":
+        logger.info("Received %r — shutting down", cmd or "EOF")
+        ctx.shutdown("stdin closed")
+        return
+
+    # ---- Create ONE persistent session ----
+    stt_inst = build_stt()
+    llm_inst = build_llm()
+    tts_inst = build_tts()
+
+    logger.info("START received — creating persistent session")
 
     session = AgentSession(
-        turn_detection=_turn_detection(),
-        min_endpointing_delay=_endpointing_delay(),
+        turn_handling=TurnHandlingOptions(
+            turn_detection="vad",
+            endpointing=EndpointingOptions(
+                min_delay=_endpointing_delay(),
+                max_delay=0.8,
+            ),
+            interruption=InterruptionOptions(
+                enabled=True,
+                mode="adaptive",
+                min_duration=0.5,
+                min_words=1,
+                resume_false_interruption=True,
+                false_interruption_timeout=3.0,
+            ),
+        ),
+        max_tool_steps=3,
     )
 
+    # Dismissal event — set when the user says goodbye, cleared on re-activation
+    dismissed = asyncio.Event()
+
+    @session.on("user_input_transcribed")
+    def _on_user_transcript(ev):
+        text = (ev.transcript or "").lower().strip()
+        if dismissed.is_set():
+            return
+        if any(phrase in text for phrase in DISMISSAL_PHRASES):
+            logger.info("Dismissal detected: %r", text)
+
+            async def _sign_off():
+                try:
+                    session.interrupt()
+                except Exception:
+                    pass
+                await asyncio.sleep(0.15)
+                handle = await session.generate_reply(
+                    instructions=f"Say exactly: '{random.choice(SLEEP_RESPONSES)}' and nothing else.",
+                )
+                try:
+                    await handle.wait_for_playout()
+                except Exception:
+                    await asyncio.sleep(2.5)
+                logger.info("Sign-off complete")
+                dismissed.set()
+
+            asyncio.create_task(_sign_off())
+
+    # Start the session ONCE — it stays alive for the whole process
     await session.start(
-        agent=FridayAgent(stt=stt, llm=llm, tts=tts),
+        agent=FridayAgent(stt=stt_inst, llm=llm_inst, tts=tts_inst),
         room=ctx.room,
     )
+    print("SESSION_STARTED", flush=True)
+    logger.info("Session active — listening for user speech")
+
+    # ---- Activation loop ----
+    while True:
+        # Wait for dismissal
+        await dismissed.wait()
+        print("SESSION_DONE", flush=True)
+        logger.info("Dismissed — waiting for next activation")
+
+        # Wait for next START from launcher
+        cmd = await _wait_for_stdin_command()
+        if cmd != "START":
+            logger.info("Received %r — shutting down", cmd or "EOF")
+            break
+
+        # Re-activate: clear dismissal, generate a fresh greeting
+        dismissed.clear()
+        logger.info("Re-activated — generating greeting")
+        print("SESSION_STARTED", flush=True)
+
+        try:
+            await session.generate_reply(
+                instructions=(
+                    "Say a quick, casual greeting — one short sentence, "
+                    "like 'Hey, what's up?' or 'Hey Shiv, what do you need?'. "
+                    "Keep it natural. Do NOT call any tools."
+                ),
+                tool_choice="none",
+            )
+            logger.info("Re-activation greeting completed")
+        except Exception as e:
+            logger.warning("Re-activation greeting failed: %s", e)
+
+    # Clean up
+    try:
+        await session.aclose()
+    except Exception:
+        pass
+    ctx.shutdown("stdin closed")
 
 
 # ---------------------------------------------------------------------------
-# Main
+# CLI
 # ---------------------------------------------------------------------------
 
 def main():
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
 
 def dev():
-    """Wrapper to run the agent in dev mode automatically."""
-    import sys
-    # If no command was provided, inject 'dev'
     if len(sys.argv) == 1:
         sys.argv.append("dev")
     main()
-
-# ---------------------------------------------------------------------------
-# Programmatic session management (used by wake-word launcher)
-# ---------------------------------------------------------------------------
-
-async def run_session(on_dismissal: asyncio.Event, silence_timeout: float = 30.0) -> None:
-    """
-    Programmatically create a LiveKit room, connect, run the voice agent,
-    and monitor for dismissal or silence timeout.
-
-    Sets on_dismissal event when the session should end.
-    """
-    http_session = aiohttp.ClientSession()
-
-    lk = lk_api.LiveKitAPI()
-    room_name = f"friday-{int(asyncio.get_event_loop().time())}"
-
-    # Create room
-    await lk.room.create_room(lk_api.CreateRoomRequest(name=room_name))
-
-    # Generate agent token
-    token = (
-        lk_api.AccessToken()
-        .with_identity("friday-agent")
-        .with_name("FRIDAY")
-        .with_grants(lk_api.VideoGrants(room_join=True, room=room_name))
-        .to_jwt()
-    )
-
-    # Connect to room
-    room = rtc.Room()
-    await room.connect(os.getenv("LIVEKIT_URL"), token)
-
-    stt = _build_stt(http_session=http_session)
-    llm = _build_llm()
-    tts = _build_tts(http_session=http_session)
-
-    agent = FridayAgent(stt=stt, llm=llm, tts=tts)
-
-    session = AgentSession(
-        turn_detection=_turn_detection(),
-        min_endpointing_delay=_endpointing_delay(),
-    )
-
-    last_speech_time = asyncio.get_event_loop().time()
-
-    async def monitor_silence():
-        nonlocal last_speech_time
-        while not on_dismissal.is_set():
-            await asyncio.sleep(1.0)
-            elapsed = asyncio.get_event_loop().time() - last_speech_time
-            if elapsed >= silence_timeout:
-                logger.info("Silence timeout reached (%.0fs), going to sleep", silence_timeout)
-                await session.generate_reply(
-                    instructions="Say a brief sign-off like 'Standing by, boss.' and nothing else."
-                )
-                await asyncio.sleep(2.0)
-                on_dismissal.set()
-
-    # Start session
-    await session.start(agent=agent, room=room)
-
-    # Start silence monitor
-    silence_task = asyncio.create_task(monitor_silence())
-
-    # Wait for dismissal
-    await on_dismissal.wait()
-
-    # Cleanup
-    silence_task.cancel()
-    await room.disconnect()
-    await lk.room.delete_room(lk_api.DeleteRoomRequest(room=room_name))
-    await lk.aclose()
-    await http_session.close()
-
 
 if __name__ == "__main__":
     main()
