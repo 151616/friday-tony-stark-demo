@@ -3,7 +3,7 @@ FRIDAY Overlay — Fullscreen click-through ambient overlay.
 
 Replaces the old floating pill widget with a subtle, screen-wide experience:
   - Accelerating ripple that reveals a blue tint on activation
-  - Breathing glow strip at the top of the screen
+  - Breathing glow aura at the top of the screen
   - Scanning pulse for thinking / booting states
   - All fully click-through — nothing blocks mouse or keyboard
 
@@ -18,7 +18,7 @@ import tkinter as tk
 from enum import Enum
 
 # ---------------------------------------------------------------------------
-# Win32 constants (avoid importing win32con just for these)
+# Win32 constants
 # ---------------------------------------------------------------------------
 
 GWL_EXSTYLE = -20
@@ -32,11 +32,11 @@ HWND_TOPMOST = -1
 GA_ROOT = 2
 
 # ---------------------------------------------------------------------------
-# DPI awareness (call before any Tk window creation)
+# DPI awareness
 # ---------------------------------------------------------------------------
 
 try:
-    ctypes.windll.shcore.SetProcessDpiAwareness(2)   # per-monitor DPI aware
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)
 except Exception:
     pass
 
@@ -49,32 +49,38 @@ TICK_MS = 1000 // FPS
 
 # Tint
 TINT_COLOR = "#0a1428"
-TINT_ALPHA_TARGET = 0.10        # steady-state tint alpha
-TINT_ALPHA_THINKING_LO = 0.10   # breathing range for thinking
-TINT_ALPHA_THINKING_HI = 0.14
-TINT_FADE_IN_DURATION = 0.3     # seconds
 TINT_FADE_OUT_DURATION = 0.3
 
 # Ripple
-RIPPLE_DURATION = 0.6           # seconds
-RIPPLE_ACCEL = 2.5              # ease-in exponent
-RIPPLE_GLOW_BANDS = 5           # concentric glow rings
-RIPPLE_GLOW_WIDTH = 8           # px between each glow band
-RIPPLE_EDGE_COLOR = "#4a9eff"
+RIPPLE_DURATION = 0.7
+RIPPLE_ACCEL = 2.5
+RIPPLE_TOTAL_BANDS = 20
+RIPPLE_BAND_WIDTH = 20
+RIPPLE_EDGE_COLOR = "#3a8adf"
 
-# Top bar (breathing glow)
-BAR_HEIGHT = 6
-BAR_COLOR = "#1a5aff"
-BAR_ALPHA_LO = 0.10
-BAR_ALPHA_HI = 0.30
-BAR_BREATHE_HZ = 1.0           # cycles per second
+# Top bar — smooth glowing aura
+BAR_HEIGHT = 60                 # tall enough for a smooth vertical fade
+BAR_COLOR = "#1a5aff"           # deepest blue
 
-# Scanning pulse (thinking / booting)
-PULSE_HZ = 0.8                  # sweeps per second
-PULSE_WIDTH_FRAC = 0.12         # fraction of screen width for the bright region
-PULSE_COLOR_BRIGHT = "#4a9eff"
-PULSE_COLOR_DIM = "#0a1a3a"
-PULSE_BANDS = 40                # number of vertical strips for the gradient sweep
+# Per-state rhythm & intensity — each state has its own fingerprint.
+#   tint_steady: steady tint alpha (None means breathing)
+#   tint_hz / tint_lo / tint_hi: tint breathing params (if not steady)
+#   bar_hz / bar_lo / bar_hi: bar alpha breathing
+STATE_PROFILES = {
+    # Cold boot — slow, deep, heavy; feels like a system warming up
+    "booting":   dict(tint_hz=0.5, tint_lo=0.08, tint_hi=0.13,
+                      bar_hz=0.5,  bar_lo=0.10, bar_hi=0.35),
+    # Waiting for you — gentle, patient
+    "listening": dict(tint_steady=0.10,
+                      bar_hz=1.0,  bar_lo=0.08, bar_hi=0.22),
+    # Actively processing — fast, bright, urgent
+    "thinking":  dict(tint_hz=1.4, tint_lo=0.10, tint_hi=0.16,
+                      bar_hz=2.4,  bar_lo=0.18, bar_hi=0.48),
+    # Talking back — steady tint, medium rhythmic bar breath
+    "speaking":  dict(tint_steady=0.10,
+                      bar_hz=1.7,  bar_lo=0.14, bar_hi=0.34),
+}
+TINT_ALPHA_TARGET = STATE_PROFILES["listening"]["tint_steady"]
 
 
 # ---------------------------------------------------------------------------
@@ -82,7 +88,6 @@ PULSE_BANDS = 40                # number of vertical strips for the gradient swe
 # ---------------------------------------------------------------------------
 
 def _lerp_color(c1: str, c2: str, t: float) -> str:
-    """Linearly interpolate between two hex colors."""
     t = max(0.0, min(1.0, t))
     r1, g1, b1 = int(c1[1:3], 16), int(c1[3:5], 16), int(c1[5:7], 16)
     r2, g2, b2 = int(c2[1:3], 16), int(c2[3:5], 16), int(c2[5:7], 16)
@@ -90,6 +95,19 @@ def _lerp_color(c1: str, c2: str, t: float) -> str:
     g = int(g1 + (g2 - g1) * t)
     b = int(b1 + (b2 - b1) * t)
     return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def _lerp_color_rgb(r1, g1, b1, r2, g2, b2, t):
+    """Fast RGB lerp without hex parsing."""
+    t = max(0.0, min(1.0, t))
+    r = int(r1 + (r2 - r1) * t)
+    g = int(g1 + (g2 - g1) * t)
+    b = int(b1 + (b2 - b1) * t)
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def _parse_hex(c: str):
+    return int(c[1:3], 16), int(c[3:5], 16), int(c[5:7], 16)
 
 
 # ---------------------------------------------------------------------------
@@ -122,30 +140,39 @@ class FridayOverlay:
         self._thread = None
         self._running = False
 
-        # Tk windows (created on Tk thread)
+        # Tk windows
         self._root = None
         self._tint_win = None
         self._tint_canvas = None
         self._bar_win = None
         self._bar_canvas = None
-        self._bar_rect = None         # the single glow rectangle
-        self._pulse_rects = []        # pulse band rectangles
 
-        # Screen dimensions (set during _setup_window)
+        # Pre-allocated canvas items
+        self._ripple_fill = None
+        self._ripple_bands = []
+
+        # Bar: one horizontal strip per pixel row (vertical gradient only)
+        self._bar_strips = []
+        self._bar_num_rows = 0
+
+        # Pre-parsed bar color
+        self._bar_rgb = _parse_hex(BAR_COLOR)
+
+        # Screen dimensions
         self._screen_w = 0
         self._screen_h = 0
 
-        # State (set from any thread, consumed by _tick)
+        # State
         self._want_state = OverlayState.SLEEPING
         self._current_state = OverlayState.SLEEPING
         self._transition_start = 0.0
-        self._loading_text = ""       # kept for backward compat with show_loading(text)
+        self._loading_text = ""
 
-        # Current alpha values (animated by _tick)
+        # Alpha tracking
         self._tint_alpha = 0.0
         self._bar_alpha = 0.0
 
-        # Tk visibility tracking
+        # Visibility tracking
         self._tint_visible = False
         self._bar_visible = False
 
@@ -153,21 +180,19 @@ class FridayOverlay:
 
     def _setup_window(self):
         self._root = tk.Tk()
-        self._root.withdraw()          # hidden root
+        self._root.withdraw()
 
         self._screen_w = self._root.winfo_screenwidth()
         self._screen_h = self._root.winfo_screenheight()
 
-        # ---- Tint window (fullscreen blue fill) ----
+        self._transparent_key = "#010101"
+        bar_bg_key = "#020202"
+
+        # ---- Tint window (fullscreen) ----
         self._tint_win = tk.Toplevel(self._root)
         self._tint_win.overrideredirect(True)
         self._tint_win.attributes("-topmost", True)
         self._tint_win.geometry(f"{self._screen_w}x{self._screen_h}+0+0")
-
-        # Use transparentcolor for the initial state so the ripple can
-        # reveal blue incrementally.  The canvas bg starts as the key color
-        # (fully transparent), and drawn items appear on top.
-        self._transparent_key = "#010101"
         self._tint_win.configure(bg=self._transparent_key)
         self._tint_win.attributes("-transparentcolor", self._transparent_key)
         self._tint_win.attributes("-alpha", 0.0)
@@ -179,16 +204,28 @@ class FridayOverlay:
         )
         self._tint_canvas.pack()
 
+        # Pre-allocate ripple items
+        self._ripple_fill = self._tint_canvas.create_oval(
+            -10, -10, -10, -10,
+            fill=TINT_COLOR, outline="", state="hidden",
+        )
+        self._ripple_bands = []
+        for _ in range(RIPPLE_TOTAL_BANDS):
+            oid = self._tint_canvas.create_oval(
+                -10, -10, -10, -10,
+                fill="", outline=RIPPLE_EDGE_COLOR,
+                width=RIPPLE_BAND_WIDTH, state="hidden",
+            )
+            self._ripple_bands.append(oid)
+
         self._tint_win.withdraw()
         self._make_click_through(self._tint_win)
 
-        # ---- Bar window (thin strip at top) ----
+        # ---- Bar window (smooth aura at top) ----
         self._bar_win = tk.Toplevel(self._root)
         self._bar_win.overrideredirect(True)
         self._bar_win.attributes("-topmost", True)
         self._bar_win.geometry(f"{self._screen_w}x{BAR_HEIGHT}+0+0")
-
-        bar_bg_key = "#020202"
         self._bar_win.configure(bg=bar_bg_key)
         self._bar_win.attributes("-transparentcolor", bar_bg_key)
         self._bar_win.attributes("-alpha", 0.0)
@@ -200,36 +237,37 @@ class FridayOverlay:
         )
         self._bar_canvas.pack()
 
-        # Single rectangle for the breathing glow
-        self._bar_rect = self._bar_canvas.create_rectangle(
-            0, 0, self._screen_w, BAR_HEIGHT,
-            fill=BAR_COLOR, outline="",
-        )
-
-        # Pulse band rectangles (used for thinking/booting shimmer)
-        band_w = max(1, self._screen_w // PULSE_BANDS)
-        self._pulse_rects = []
-        for i in range(PULSE_BANDS):
-            x1 = i * band_w
-            x2 = x1 + band_w
-            rect = self._bar_canvas.create_rectangle(
-                x1, 0, x2, BAR_HEIGHT,
-                fill=PULSE_COLOR_DIM, outline="", state="hidden",
+        # Build the bar: ONE full-width horizontal strip per pixel row.
+        # ~60 canvas items total (vs 28,800) — vertical gradient only, no
+        # horizontal animation. All "thinking" feedback comes from animating
+        # the window alpha faster/brighter, which is essentially free.
+        self._bar_num_rows = BAR_HEIGHT
+        bg_rgb = _parse_hex(bar_bg_key)
+        self._bar_strips = []
+        for row in range(self._bar_num_rows):
+            t = 1.0 - (row / max(1, self._bar_num_rows - 1))
+            fade = t * t  # quadratic falloff — strong at top, soft tail
+            color = _lerp_color_rgb(
+                bg_rgb[0], bg_rgb[1], bg_rgb[2],
+                self._bar_rgb[0], self._bar_rgb[1], self._bar_rgb[2],
+                fade,
             )
-            self._pulse_rects.append(rect)
+            strip = self._bar_canvas.create_rectangle(
+                0, row, self._screen_w, row + 1,
+                fill=color, outline="",
+            )
+            self._bar_strips.append(strip)
 
         self._bar_win.withdraw()
         self._make_click_through(self._bar_win)
 
     def _make_click_through(self, tk_window):
-        """Apply WS_EX_TRANSPARENT | WS_EX_LAYERED to make a window click-through."""
         tk_window.update_idletasks()
         hwnd = tk_window.winfo_id()
         hwnd = ctypes.windll.user32.GetAncestor(hwnd, GA_ROOT)
         ex_style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
         ex_style |= WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST
         ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, ex_style)
-        # Ensure topmost sticks
         ctypes.windll.user32.SetWindowPos(
             hwnd, HWND_TOPMOST, 0, 0, 0, 0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
@@ -275,126 +313,83 @@ class FridayOverlay:
             self._bar_visible = False
             self._bar_alpha = 0.0
 
-    # -- Ripple drawing (Tk thread) ----------------------------------------
+    # -- Ripple (Tk thread) ------------------------------------------------
 
     def _draw_ripple(self, progress: float):
-        """Draw the expanding gradient ring that reveals the tint.
-
-        The ring is a soft gradient both ahead of and behind the leading edge:
-          - Outer glow bands (ahead): fade from bright → transparent
-          - Inner glow bands (behind): fade from bright → tint color
-          - Filled interior behind everything: solid tint
-        No hard edge anywhere — the whole ring is a smooth gradient bloom.
-        """
-        self._tint_canvas.delete("ripple")
-
         cx = self._screen_w / 2
         cy = self._screen_h / 2
-        # Max radius = corner distance so the circle covers the whole screen
         max_radius = math.hypot(cx, cy)
         radius = max_radius * progress
 
         if radius < 1:
             return
 
-        # 1. Filled interior (the tint reveal)
-        inner_radius = max(1, radius - RIPPLE_GLOW_BANDS * RIPPLE_GLOW_WIDTH)
-        self._tint_canvas.create_oval(
-            cx - inner_radius, cy - inner_radius,
-            cx + inner_radius, cy + inner_radius,
-            fill=TINT_COLOR, outline="", tags="ripple",
+        half = RIPPLE_TOTAL_BANDS // 2
+        total_spread = RIPPLE_TOTAL_BANDS * RIPPLE_BAND_WIDTH
+
+        inner_r = max(1, radius - total_spread * 0.5)
+        self._tint_canvas.coords(
+            self._ripple_fill,
+            cx - inner_r, cy - inner_r, cx + inner_r, cy + inner_r,
         )
+        self._tint_canvas.itemconfig(self._ripple_fill, state="normal")
 
-        # 2. Inner glow bands (behind the edge — bright → tint)
-        for i in range(RIPPLE_GLOW_BANDS):
-            band_radius = radius - i * RIPPLE_GLOW_WIDTH
-            if band_radius < 1:
-                break
-            t = i / max(1, RIPPLE_GLOW_BANDS - 1)
-            color = _lerp_color(RIPPLE_EDGE_COLOR, TINT_COLOR, t)
-            self._tint_canvas.create_oval(
-                cx - band_radius, cy - band_radius,
-                cx + band_radius, cy + band_radius,
-                fill="", outline=color, width=2, tags="ripple",
+        for idx, oid in enumerate(self._ripple_bands):
+            offset = (idx - half) * RIPPLE_BAND_WIDTH
+            band_r = radius + offset
+
+            if band_r < 1:
+                self._tint_canvas.itemconfig(oid, state="hidden")
+                continue
+
+            dist_from_center = abs(idx - half) / max(half, 1)
+            if idx < half:
+                color = _lerp_color(RIPPLE_EDGE_COLOR, TINT_COLOR, dist_from_center)
+            else:
+                color = _lerp_color(RIPPLE_EDGE_COLOR, self._transparent_key, dist_from_center)
+
+            self._tint_canvas.coords(
+                oid, cx - band_r, cy - band_r, cx + band_r, cy + band_r,
+            )
+            self._tint_canvas.itemconfig(
+                oid, outline=color, width=RIPPLE_BAND_WIDTH, state="normal",
             )
 
-        # 3. Outer glow bands (ahead of the edge — bright → transparent key)
-        for i in range(RIPPLE_GLOW_BANDS):
-            band_radius = radius + (i + 1) * RIPPLE_GLOW_WIDTH
-            t = (i + 1) / RIPPLE_GLOW_BANDS
-            color = _lerp_color(RIPPLE_EDGE_COLOR, self._transparent_key, t)
-            self._tint_canvas.create_oval(
-                cx - band_radius, cy - band_radius,
-                cx + band_radius, cy + band_radius,
-                fill="", outline=color, width=2, tags="ripple",
-            )
+    def _hide_ripple_items(self):
+        self._tint_canvas.itemconfig(self._ripple_fill, state="hidden")
+        for oid in self._ripple_bands:
+            self._tint_canvas.itemconfig(oid, state="hidden")
 
     def _finalize_ripple(self):
-        """Replace the ripple ovals with a solid tint background."""
-        self._tint_canvas.delete("ripple")
+        self._hide_ripple_items()
         self._tint_canvas.configure(bg=TINT_COLOR)
-        # Remove the transparent key since the whole canvas is now tinted
         self._tint_win.attributes("-transparentcolor", "")
 
     def _reset_tint_canvas(self):
-        """Reset tint canvas to transparent for next activation."""
-        self._tint_canvas.delete("ripple")
+        self._hide_ripple_items()
         self._tint_canvas.configure(bg=self._transparent_key)
         self._tint_win.attributes("-transparentcolor", self._transparent_key)
 
-    # -- Bar mode switches (Tk thread) -------------------------------------
+    # -- Bar animations (Tk thread) ----------------------------------------
 
-    def _apply_glow_mode(self):
-        """Show the single breathing glow rectangle, hide pulse bands."""
-        if not self._bar_canvas:
-            return
-        self._bar_canvas.itemconfig(self._bar_rect, state="normal")
-        for r in self._pulse_rects:
-            self._bar_canvas.itemconfig(r, state="hidden")
+    def _breath(self, hz: float, lo: float, hi: float) -> float:
+        """Sine-based alpha breath at `hz` cycles/sec between lo and hi."""
+        t = time.time() * hz * 2 * math.pi
+        return lo + (hi - lo) * (0.5 + 0.5 * math.sin(t))
 
-    def _apply_pulse_mode(self):
-        """Show the pulse bands, hide the glow rectangle."""
-        if not self._bar_canvas:
-            return
-        self._bar_canvas.itemconfig(self._bar_rect, state="hidden")
-        for r in self._pulse_rects:
-            self._bar_canvas.itemconfig(r, state="normal")
-
-    # -- Animations (Tk thread) --------------------------------------------
-
-    def _update_breathing_glow(self):
-        """Oscillate bar window alpha with sin(time)."""
-        t = time.time() * BAR_BREATHE_HZ * 2 * math.pi
-        alpha = BAR_ALPHA_LO + (BAR_ALPHA_HI - BAR_ALPHA_LO) * (0.5 + 0.5 * math.sin(t))
-        self._set_bar_alpha(alpha)
-
-    def _update_scanning_pulse(self):
-        """Sweep a bright Gaussian region across the pulse bands."""
-        if not self._pulse_rects:
-            return
-        t = (time.time() * PULSE_HZ) % 1.0
-        # Bounce: 0→1→0
-        pos = t * 2 if t < 0.5 else 2 - t * 2
-        center = pos * PULSE_BANDS
-        sigma = PULSE_BANDS * PULSE_WIDTH_FRAC
-
-        for i, rect in enumerate(self._pulse_rects):
-            dist = abs(i - center) / max(sigma, 0.1)
-            brightness = math.exp(-dist * dist)
-            color = _lerp_color(PULSE_COLOR_DIM, PULSE_COLOR_BRIGHT, brightness)
-            self._bar_canvas.itemconfig(rect, fill=color)
-
-        # Keep bar visible at a moderate alpha during pulse
-        self._set_bar_alpha(0.35)
-
-    def _update_breathing_tint(self):
-        """Oscillate tint alpha for thinking state."""
-        t = time.time() * 1.0 * 2 * math.pi  # 1 Hz
-        alpha = TINT_ALPHA_THINKING_LO + (
-            (TINT_ALPHA_THINKING_HI - TINT_ALPHA_THINKING_LO) *
-            (0.5 + 0.5 * math.sin(t))
+    def _apply_profile(self, profile: dict):
+        """Apply a state profile's per-frame tint + bar animation."""
+        # Tint
+        if "tint_steady" in profile:
+            self._set_tint_alpha(profile["tint_steady"])
+        else:
+            self._set_tint_alpha(
+                self._breath(profile["tint_hz"], profile["tint_lo"], profile["tint_hi"])
+            )
+        # Bar
+        self._set_bar_alpha(
+            self._breath(profile["bar_hz"], profile["bar_lo"], profile["bar_hi"])
         )
-        self._set_tint_alpha(alpha)
 
     # -- Main tick (Tk thread) ---------------------------------------------
 
@@ -413,90 +408,83 @@ class FridayOverlay:
             self._current_state = want
 
             if want == OverlayState.SLEEPING:
-                # Immediate hide (DISMISSING handles the fade, this is the fallback)
                 self._hide_tint()
                 self._hide_bar()
                 self._reset_tint_canvas()
 
             elif want == OverlayState.BOOTING:
                 self._reset_tint_canvas()
-                # For booting, use solid tint bg immediately (no ripple)
                 self._tint_canvas.configure(bg=TINT_COLOR)
                 self._tint_win.attributes("-transparentcolor", "")
                 self._set_tint_alpha(0.0)
                 self._show_tint()
-                self._apply_pulse_mode()
                 self._show_bar()
 
             elif want == OverlayState.WAKING:
                 self._reset_tint_canvas()
                 self._set_tint_alpha(TINT_ALPHA_TARGET)
                 self._show_tint()
-                # Bar stays hidden during ripple
 
             elif want == OverlayState.LISTENING:
                 if prev == OverlayState.WAKING:
                     self._finalize_ripple()
+                elif prev != OverlayState.SPEAKING and prev != OverlayState.THINKING:
+                    self._tint_canvas.configure(bg=TINT_COLOR)
+                    self._tint_win.attributes("-transparentcolor", "")
                 self._set_tint_alpha(TINT_ALPHA_TARGET)
                 self._show_tint()
-                self._apply_glow_mode()
                 self._show_bar()
 
             elif want == OverlayState.THINKING:
-                self._apply_pulse_mode()
                 self._show_bar()
                 self._show_tint()
 
             elif want == OverlayState.SPEAKING:
-                self._apply_glow_mode()
                 self._set_tint_alpha(TINT_ALPHA_TARGET)
                 self._show_tint()
                 self._show_bar()
 
             elif want == OverlayState.DISMISSING:
-                pass  # fade handled below
+                pass
 
-        # ---- Per-frame animation for current state ----
+        # ---- Per-frame animation ----
         elapsed = now - self._transition_start
 
         if self._current_state == OverlayState.SLEEPING:
-            pass  # nothing to do
+            pass
 
         elif self._current_state == OverlayState.BOOTING:
-            # Slow tint fade-in over 1 second, then breathing
+            profile = STATE_PROFILES["booting"]
             if elapsed < 1.0:
-                self._set_tint_alpha(TINT_ALPHA_TARGET * (elapsed / 1.0))
-                self._set_bar_alpha(0.35 * (elapsed / 1.0))
+                # Fade in to the profile's peaks, then start breathing
+                frac = elapsed / 1.0
+                self._set_tint_alpha(profile["tint_hi"] * frac)
+                self._set_bar_alpha(profile["bar_hi"] * frac)
             else:
-                self._update_breathing_tint()
-            self._update_scanning_pulse()
+                self._apply_profile(profile)
 
         elif self._current_state == OverlayState.WAKING:
-            # Accelerating ripple
             if elapsed < RIPPLE_DURATION:
                 progress = (elapsed / RIPPLE_DURATION) ** RIPPLE_ACCEL
                 self._draw_ripple(progress)
             else:
-                # Ripple done → auto-transition to LISTENING
                 self._want_state = OverlayState.LISTENING
 
         elif self._current_state == OverlayState.LISTENING:
-            self._update_breathing_glow()
+            self._apply_profile(STATE_PROFILES["listening"])
 
         elif self._current_state == OverlayState.THINKING:
-            self._update_breathing_tint()
-            self._update_scanning_pulse()
+            self._apply_profile(STATE_PROFILES["thinking"])
 
         elif self._current_state == OverlayState.SPEAKING:
-            self._update_breathing_glow()
+            self._apply_profile(STATE_PROFILES["speaking"])
 
         elif self._current_state == OverlayState.DISMISSING:
             if elapsed < TINT_FADE_OUT_DURATION:
                 frac = 1.0 - (elapsed / TINT_FADE_OUT_DURATION)
                 self._set_tint_alpha(TINT_ALPHA_TARGET * frac)
-                self._set_bar_alpha(BAR_ALPHA_HI * frac)
+                self._set_bar_alpha(STATE_PROFILES["speaking"]["bar_hi"] * frac)
             else:
-                # Fade done → sleep
                 self._hide_tint()
                 self._hide_bar()
                 self._reset_tint_canvas()
@@ -508,17 +496,9 @@ class FridayOverlay:
     # -- Public API (thread-safe, just sets flags) -------------------------
 
     def show(self):
-        """Show the overlay in listening/active mode."""
         self._want_state = OverlayState.LISTENING
 
     def show_loading(self, text: str = ""):
-        """Show a loading/processing state.
-
-        Maps to:
-          - 'Waking' or similar → WAKING (ripple)
-          - 'Thinking' → THINKING (breathing + pulse)
-          - Anything else (boot, reboot) → BOOTING
-        """
         self._loading_text = text
         lower = text.lower()
         if "waking" in lower or "wake" in lower:
@@ -529,11 +509,9 @@ class FridayOverlay:
             self._want_state = OverlayState.BOOTING
 
     def hide_loading(self):
-        """Transition from loading/thinking to speaking."""
         self._want_state = OverlayState.SPEAKING
 
     def hide(self):
-        """Dismiss the overlay with a fade-out."""
         if self._current_state == OverlayState.SLEEPING:
             return
         self._want_state = OverlayState.DISMISSING
@@ -541,7 +519,6 @@ class FridayOverlay:
     # -- Lifecycle ---------------------------------------------------------
 
     def start(self):
-        """Start the overlay in a background thread."""
         self._running = True
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
@@ -552,7 +529,6 @@ class FridayOverlay:
         self._root.mainloop()
 
     def stop(self):
-        """Stop the overlay."""
         self._running = False
         self._want_state = OverlayState.SLEEPING
         if self._root:

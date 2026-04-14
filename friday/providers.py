@@ -26,7 +26,7 @@ def build_stt(http_session=None):
     if STT_PROVIDER == "sarvam":
         logger.info("STT → Sarvam Saaras v3")
         return sarvam.STT(
-            language="unknown",
+            language="en-IN",
             model="saaras:v3",
             mode="transcribe",
             flush_signal=True,

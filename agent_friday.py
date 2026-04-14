@@ -291,12 +291,16 @@ class FridayAgent(Agent):
 
     async def on_enter(self) -> None:
         logger.info("on_enter — generating greeting")
+        from datetime import datetime
+        now = datetime.now().strftime("%A, %I:%M %p")
         try:
             await self.session.generate_reply(
                 instructions=(
+                    f"It is currently {now}. "
                     "Say a quick, casual greeting — one short sentence, "
                     "like 'Hey, what's up?' or 'Hey Shiv, what do you need?'. "
-                    "Keep it natural. Do NOT call any tools."
+                    "Keep it natural. Do NOT call any tools. "
+                    "Do NOT mention the day or time unless it's relevant."
                 ),
                 tool_choice="none",
             )
@@ -433,11 +437,15 @@ async def entrypoint(ctx: JobContext) -> None:
         print("SESSION_STARTED", flush=True)
 
         try:
+            from datetime import datetime
+            now = datetime.now().strftime("%A, %I:%M %p")
             await session.generate_reply(
                 instructions=(
+                    f"It is currently {now}. "
                     "Say a quick, casual greeting — one short sentence, "
                     "like 'Hey, what's up?' or 'Hey Shiv, what do you need?'. "
-                    "Keep it natural. Do NOT call any tools."
+                    "Keep it natural. Do NOT call any tools. "
+                    "Do NOT mention the day or time unless it's relevant."
                 ),
                 tool_choice="none",
             )

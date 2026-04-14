@@ -67,7 +67,11 @@ class WakeWordListener:
     """Continuously listens for the wake word on the mic."""
 
     def __init__(self, model_name: str = WAKE_MODEL, threshold: float = WAKE_THRESHOLD):
-        self._model = WakeWordModel(wakeword_models=[model_name])
+        # Use onnx instead of tflite — tflite-runtime has no Windows wheels.
+        self._model = WakeWordModel(
+            wakeword_models=[model_name],
+            inference_framework="onnx",
+        )
         self._threshold = threshold
         self._audio = pyaudio.PyAudio()
         self._stream = None
