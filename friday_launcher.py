@@ -11,7 +11,9 @@ Usage:
 """
 
 import asyncio
+import ctypes
 import logging
+import logging.handlers
 import os
 import signal
 import subprocess
@@ -19,38 +21,151 @@ import sys
 import threading
 import time
 import winsound
+from ctypes import wintypes
 from enum import Enum
 from pathlib import Path
 
+import keyboard
 import numpy as np
 import pyaudio
 from dotenv import load_dotenv
 from openwakeword.model import Model as WakeWordModel
 from friday_overlay import FridayOverlay
 
+
+# ---------------------------------------------------------------------------
+# Disable Windows EcoQoS / power throttling
+# ---------------------------------------------------------------------------
+# When launched silently from startup, Windows marks us as a background
+# process and throttles CPU to favour battery life. That makes the overlay
+# visibly laggy and slows model inference. Opt out explicitly.
+
+_PROCESS_POWER_THROTTLING_EXECUTION_SPEED = 0x1
+_PROCESS_POWER_THROTTLING_CURRENT_VERSION = 1
+_ProcessPowerThrottling = 4
+
+_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+_kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+_kernel32.SetProcessInformation.argtypes = [
+    wintypes.HANDLE,
+    ctypes.c_int,
+    ctypes.c_void_p,
+    wintypes.DWORD,
+]
+_kernel32.SetProcessInformation.restype = wintypes.BOOL
+_kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+_kernel32.OpenProcess.restype = wintypes.HANDLE
+_kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+_kernel32.CloseHandle.restype = wintypes.BOOL
+
+
+class _POWER_THROTTLING_STATE(ctypes.Structure):
+    _fields_ = [
+        ("Version", wintypes.ULONG),
+        ("ControlMask", wintypes.ULONG),
+        ("StateMask", wintypes.ULONG),
+    ]
+
+
+def _disable_power_throttling(process_handle=None) -> bool:
+    """Tell Windows: don't throttle this process. Returns True on success."""
+    try:
+        if process_handle is None:
+            process_handle = _kernel32.GetCurrentProcess()
+        state = _POWER_THROTTLING_STATE()
+        state.Version = _PROCESS_POWER_THROTTLING_CURRENT_VERSION
+        state.ControlMask = _PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+        state.StateMask = 0  # 0 = opt OUT of throttling
+        ok = _kernel32.SetProcessInformation(
+            process_handle,
+            _ProcessPowerThrottling,
+            ctypes.byref(state),
+            ctypes.sizeof(state),
+        )
+        if not ok:
+            err = ctypes.get_last_error()
+            # Stash so main() can log it once the logger is configured.
+            globals()["_THROTTLE_ERR"] = err
+        return bool(ok)
+    except Exception as e:
+        globals()["_THROTTLE_ERR"] = repr(e)
+        return False
+
+
+_THROTTLE_ERR = None
+_disable_power_throttling()  # apply to self ASAP, before heavy imports run
+
+# Global hotkeys — registered on the OS hook, so they fire from any app.
+KILL_HOTKEY = "ctrl+alt+shift+q"      # Hard kill: tear down and exit.
+RESTART_HOTKEY = "ctrl+alt+shift+r"   # Kill + relaunch (picks up code edits).
+PTT_HOTKEY = "ctrl+alt+space"         # Force-activate a session — bypasses
+                                       # wake word & speaker check. For noisy
+                                       # rooms or when you want guaranteed activation.
+
+# Path to the silent .vbs wrapper used by the restart hotkey.
+SILENT_LAUNCHER = Path(__file__).parent / "start_friday.vbs"
+
 load_dotenv()
 
-logger = logging.getLogger("friday-launcher")
+# ---------------------------------------------------------------------------
+# Logging — to console AND to a rotating file. The .vbs silent launcher
+# discards stdout, so the file is the only post-mortem source. Capture
+# everything: launcher logs, agent subprocess stdout, unhandled exceptions.
+# ---------------------------------------------------------------------------
+
+LOG_DIR = Path(__file__).parent / "logs"
+LOG_DIR.mkdir(exist_ok=True)
+LOG_FILE = LOG_DIR / "friday.log"
+
+_log_fmt = logging.Formatter(
+    "%(asctime)s [%(name)s] %(levelname)s: %(message)s"
+)
+_file_handler = logging.handlers.RotatingFileHandler(
+    LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+)
+_file_handler.setFormatter(_log_fmt)
+_console_handler = logging.StreamHandler()
+_console_handler.setFormatter(_log_fmt)
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+    handlers=[_file_handler, _console_handler],
 )
+logger = logging.getLogger("friday-launcher")
+
+# Route uncaught exceptions into the log file too.
+def _excepthook(exc_type, exc_value, exc_tb):
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+        return
+    logger.critical("Uncaught exception", exc_info=(exc_type, exc_value, exc_tb))
+
+sys.excepthook = _excepthook
+logger.info("=" * 70)
+logger.info("FRIDAY launcher starting — log file: %s", LOG_FILE)
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
 WAKE_MODEL = "hey_jarvis_v0.1"
-WAKE_THRESHOLD = 0.7
+WAKE_THRESHOLD = 0.7          # was 0.7 — fewer false wakes from background noise
 SILENCE_TIMEOUT = 30.0
 AUDIO_RATE = 16000
 AUDIO_CHUNK = 1280  # 80ms at 16kHz
 CHIME_PATH = Path(__file__).parent / "sounds" / "activate.wav"
+
+# Mic selection — name substring (case-insensitive) of the device to use.
+# Empty / unset = system default. Run `python list_audio_devices.py` to see
+# what's available. WAKE_MIC governs the always-on wake-word listener;
+# SESSION_MIC governs the agent subprocess (set via env var, applied below).
+WAKE_MIC = os.getenv("WAKE_MIC", "").strip()
+SESSION_MIC = os.getenv("SESSION_MIC", "").strip()
 # MCP server no longer needed — tools are registered directly on the agent
 
 # Speaker verification
 VOICE_EMBEDDING_PATH = Path(__file__).parent / "voice_embedding.npy"
-SPEAKER_SIM_THRESHOLD = 0.70   # cosine similarity; tune between 0.65–0.80
+SPEAKER_SIM_THRESHOLD = 0.70   # was 0.70 — stricter "is this the enrolled voice"
 SPEAKER_BUFFER_SECONDS = 2.5   # last N seconds of mic audio to verify against
 
 
@@ -62,6 +177,25 @@ class State(Enum):
 # ---------------------------------------------------------------------------
 # Wake word listener
 # ---------------------------------------------------------------------------
+
+def _resolve_input_device(pa: pyaudio.PyAudio, name_substr: str) -> int | None:
+    """Return the index of the first input device whose name contains
+    `name_substr` (case-insensitive). None means use system default."""
+    if not name_substr:
+        return None
+    needle = name_substr.lower()
+    for i in range(pa.get_device_count()):
+        info = pa.get_device_info_by_index(i)
+        if int(info["maxInputChannels"]) <= 0:
+            continue
+        if needle in info["name"].lower():
+            logger.info("Resolved mic %r → index %d (%s)",
+                        name_substr, i, info["name"])
+            return i
+    logger.warning("WAKE_MIC %r not found — falling back to system default",
+                   name_substr)
+    return None
+
 
 class WakeWordListener:
     """Continuously listens for the wake word on the mic."""
@@ -76,6 +210,7 @@ class WakeWordListener:
         self._audio = pyaudio.PyAudio()
         self._stream = None
         self._enabled = True
+        self._device_index = _resolve_input_device(self._audio, WAKE_MIC)
         # Ring buffer of the last SPEAKER_BUFFER_SECONDS of int16 audio.
         self._buffer_max = int(AUDIO_RATE * SPEAKER_BUFFER_SECONDS)
         self._buffer = np.zeros(self._buffer_max, dtype=np.int16)
@@ -87,9 +222,11 @@ class WakeWordListener:
             channels=1,
             rate=AUDIO_RATE,
             input=True,
+            input_device_index=self._device_index,
             frames_per_buffer=AUDIO_CHUNK,
         )
-        logger.info("Mic stream opened for wake word detection")
+        logger.info("Mic stream opened for wake word detection (device=%s)",
+                    self._device_index if self._device_index is not None else "default")
 
     def stop_stream(self):
         if self._stream:
@@ -142,6 +279,8 @@ class WakeWordListener:
         prediction = self._model.predict(audio)
 
         for model_name, score in prediction.items():
+            if score > 0.1:
+                logger.debug("Wake word trace: %s = %.3f", model_name, score)
             if score >= self._threshold:
                 logger.info("Wake word detected! (model=%s, score=%.3f)", model_name, score)
                 return True
@@ -261,6 +400,20 @@ class AgentProcess:
         )
         logger.info("Agent subprocess started (PID %d) — cold-booting models…",
                      self._proc.pid)
+        # Opt the child out of Windows EcoQoS too — it inherits the throttle
+        # bit from us inconsistently, so set it explicitly via OpenProcess.
+        try:
+            PROCESS_SET_INFORMATION = 0x0200
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            h = _kernel32.OpenProcess(
+                PROCESS_SET_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION,
+                False, self._proc.pid,
+            )
+            if h:
+                _disable_power_throttling(h)
+                _kernel32.CloseHandle(h)
+        except Exception as e:
+            logger.debug("Could not unthrottle child process: %s", e)
         self._reader_thread = threading.Thread(
             target=self._read_stdout, daemon=True
         )
@@ -287,7 +440,10 @@ class AgentProcess:
                     if self._on_speaking:
                         self._on_speaking()
                 elif stripped:
+                    # Echo to console (visible if we have one) AND log file
+                    # via the agent-tagged logger, so silent runs are debuggable.
                     print(stripped, flush=True)
+                    logging.getLogger("friday-agent").info(stripped)
         except Exception as e:
             logger.debug("stdout reader error: %s", e)
         finally:
@@ -338,6 +494,10 @@ class AgentProcess:
 
 
 async def launcher_loop():
+    if _disable_power_throttling():
+        logger.info("Power throttling: DISABLED (full CPU)")
+    else:
+        logger.warning("Power throttling: could not disable (err=%r)", _THROTTLE_ERR)
     wakeword = WakeWordListener()
     overlay = FridayOverlay()
     verifier = SpeakerVerifier()
@@ -347,6 +507,83 @@ async def launcher_loop():
     )
 
     overlay.start()
+
+    # ---- Global hotkeys --------------------------------------------------
+    # Registered on the OS hook, so they fire even when FRIDAY isn't focused.
+
+    def _teardown():
+        """Best-effort shutdown of every resource we own."""
+        try:
+            overlay.stop()
+        except Exception:
+            pass
+        try:
+            wakeword.cleanup()
+        except Exception:
+            pass
+        try:
+            agent.stop()
+        except Exception:
+            pass
+
+    def _kill_switch():
+        logger.warning("KILL SWITCH pressed (%s) — shutting down NOW", KILL_HOTKEY)
+        _teardown()
+        # Hard-exit — skip asyncio teardown so nothing can hang.
+        os._exit(0)
+
+    def _restart_switch():
+        logger.warning("RESTART pressed (%s) — relaunching to pick up code changes",
+                       RESTART_HOTKEY)
+        # Spawn the silent .vbs wrapper fully detached, so it survives us dying.
+        # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP unlinks it from our job.
+        try:
+            subprocess.Popen(
+                ["wscript.exe", str(SILENT_LAUNCHER)],
+                cwd=str(SILENT_LAUNCHER.parent),
+                creationflags=(
+                    subprocess.DETACHED_PROCESS
+                    | subprocess.CREATE_NEW_PROCESS_GROUP
+                ),
+                close_fds=True,
+            )
+            logger.info("New FRIDAY instance spawned — dying now")
+        except Exception as e:
+            logger.error("Restart spawn failed: %s", e)
+            return
+        _teardown()
+        os._exit(0)
+
+    try:
+        keyboard.add_hotkey(KILL_HOTKEY, _kill_switch)
+        logger.info("Kill switch armed → press %s to terminate FRIDAY", KILL_HOTKEY)
+    except Exception as e:
+        logger.warning("Could not register kill-switch hotkey: %s", e)
+
+    try:
+        keyboard.add_hotkey(RESTART_HOTKEY, _restart_switch)
+        logger.info("Restart armed → press %s to reload FRIDAY with new code",
+                    RESTART_HOTKEY)
+    except Exception as e:
+        logger.warning("Could not register restart hotkey: %s", e)
+
+    # ---- Push-to-talk activation -----------------------------------------
+    # The SLEEPING loop checks this event every wake-word tick (~80ms), so
+    # perceived latency from key press to chime is < 100ms. The loop is
+    # what decides when to honour it — stale presses during ACTIVE are
+    # cleared on re-entry to SLEEPING.
+    ptt_event = threading.Event()
+
+    def _ptt_pressed():
+        logger.info("PTT pressed (%s)", PTT_HOTKEY)
+        ptt_event.set()
+
+    try:
+        keyboard.add_hotkey(PTT_HOTKEY, _ptt_pressed)
+        logger.info("Push-to-talk armed → press %s to activate without wake word",
+                    PTT_HOTKEY)
+    except Exception as e:
+        logger.warning("Could not register PTT hotkey: %s", e)
 
     # ---- One-time cold boot: spawn the agent and load models ----
     overlay.show_loading("Booting up Omnicron...")
@@ -375,6 +612,17 @@ async def launcher_loop():
                     await agent.wait_ready(timeout=60.0)
                     overlay.hide()
                     wakeword.start_stream()
+
+                # Push-to-talk has priority — explicit user action skips
+                # both wake-word match and speaker verification.
+                if ptt_event.is_set():
+                    ptt_event.clear()
+                    logger.info("Manual activation via PTT — bypassing wake/speaker checks")
+                    play_chime()
+                    overlay.show_loading("Waking up...")
+                    state = State.ACTIVE
+                    logger.info("State → ACTIVE")
+                    continue
 
                 detected = await asyncio.get_event_loop().run_in_executor(
                     None, wakeword.listen_once
@@ -417,6 +665,7 @@ async def launcher_loop():
                 await asyncio.sleep(1.5)
                 wakeword.reset()
                 wakeword.start_stream()
+                ptt_event.clear()  # discard any presses during the session
                 state = State.SLEEPING
                 logger.info("State → SLEEPING")
 

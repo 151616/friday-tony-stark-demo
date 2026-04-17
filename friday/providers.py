@@ -11,8 +11,11 @@ from .config import (
     GEMINI_LLM_MODEL, OPENAI_LLM_MODEL, GROQ_LLM_MODEL, OLLAMA_LLM_MODEL,
     OPENAI_TTS_MODEL, OPENAI_TTS_VOICE, TTS_SPEED,
     SARVAM_TTS_LANGUAGE, SARVAM_TTS_SPEAKER,
+    FAST_THINKING_BUDGET, PLANNER_THINKING_BUDGET,
     logger,
 )
+
+from typing import Literal
 
 from livekit.plugins import (
     deepgram as lk_deepgram,
@@ -40,16 +43,19 @@ def build_stt(http_session=None):
         raise ValueError(f"Unknown STT_PROVIDER: {STT_PROVIDER!r}")
 
 
-def build_llm():
+def build_llm(mode: Literal["fast", "planner"] = "fast"):
+    budget = PLANNER_THINKING_BUDGET if mode == "planner" else FAST_THINKING_BUDGET
+    
     if LLM_PROVIDER == "openai":
-        logger.info("LLM → OpenAI (%s)", OPENAI_LLM_MODEL)
+        logger.info("LLM → OpenAI (%s) [mode=%s]", OPENAI_LLM_MODEL, mode)
         return lk_openai.LLM(model=OPENAI_LLM_MODEL)
     elif LLM_PROVIDER == "gemini":
-        logger.info("LLM → Google Gemini (%s)", GEMINI_LLM_MODEL)
+        logger.info("LLM → Google Gemini (%s) [mode=%s, budget=%d]", GEMINI_LLM_MODEL, mode, budget)
         return lk_google.LLM(
             model=GEMINI_LLM_MODEL,
             api_key=os.getenv("GOOGLE_API_KEY"),
-            thinking_config={"thinking_budget": 0},
+            # Only supply a thinking_config if budget is positive
+            thinking_config={"thinking_budget": budget} if budget > 0 else None,
         )
     elif LLM_PROVIDER == "groq":
         logger.info("LLM → Groq (%s)", GROQ_LLM_MODEL)

@@ -189,17 +189,21 @@ class FridayOverlay:
         bar_bg_key = "#020202"
 
         # ---- Tint window (fullscreen) ----
+        # Leave a 2px strip at the bottom uncovered so the Windows
+        # autohide taskbar can still slide up. A fullscreen topmost layered
+        # window owns the reveal zone otherwise, even with WS_EX_TRANSPARENT.
+        tint_h = self._screen_h - 2
         self._tint_win = tk.Toplevel(self._root)
         self._tint_win.overrideredirect(True)
         self._tint_win.attributes("-topmost", True)
-        self._tint_win.geometry(f"{self._screen_w}x{self._screen_h}+0+0")
+        self._tint_win.geometry(f"{self._screen_w}x{tint_h}+0+0")
         self._tint_win.configure(bg=self._transparent_key)
         self._tint_win.attributes("-transparentcolor", self._transparent_key)
         self._tint_win.attributes("-alpha", 0.0)
 
         self._tint_canvas = tk.Canvas(
             self._tint_win,
-            width=self._screen_w, height=self._screen_h,
+            width=self._screen_w, height=tint_h,
             bg=self._transparent_key, highlightthickness=0,
         )
         self._tint_canvas.pack()

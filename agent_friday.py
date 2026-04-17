@@ -10,17 +10,48 @@ Run:
 """
 
 import asyncio
+import os
 import re
 import random
 import sys
-import webbrowser
 
 import numpy as np
-from livekit import rtc, agents
+
+# ---------------------------------------------------------------------------
+# Mic selection — apply BEFORE livekit imports, so sounddevice picks it up.
+# Set SESSION_MIC=<name substring> in your .env (e.g. "USB Microphone") to
+# route the agent's mic capture to a specific device. Empty = system default.
+# ---------------------------------------------------------------------------
+def _apply_session_mic() -> None:
+    name = os.getenv("SESSION_MIC", "").strip()
+    if not name:
+        return
+    try:
+        import sounddevice as sd
+        needle = name.lower()
+        for idx, info in enumerate(sd.query_devices()):
+            if int(info.get("max_input_channels", 0)) <= 0:
+                continue
+            if needle in info["name"].lower():
+                # Tuple is (input, output); leave output as default.
+                sd.default.device = (idx, sd.default.device[1])
+                print(f"SESSION_MIC resolved: {info['name']!r} (idx={idx})",
+                      flush=True)
+                return
+        print(f"SESSION_MIC {name!r} not found — using system default", flush=True)
+    except Exception as e:
+        print(f"SESSION_MIC setup failed: {e}", flush=True)
+
+_apply_session_mic()
+
+from pathlib import Path
+
+from livekit import rtc
 from livekit.agents import (
     JobContext, WorkerOptions, cli,
     llm as lk_llm, stt, TurnHandlingOptions,
 )
+from livekit.agents.llm.mcp import MCPServerStdio, MCPToolset
 from livekit.agents.voice import Agent, AgentSession
 from livekit.agents.voice.turn import InterruptionOptions, EndpointingOptions
 from livekit.plugins import silero
@@ -32,7 +63,9 @@ from friday.config import (
 )
 from friday.providers import build_stt, build_llm, build_tts
 from friday.speaker_gate import get_speaker_gate
-from friday.tools.web import SEED_FEEDS, fetch_and_parse_feed
+
+# Repo root — used to locate server.py when spawning the MCP subprocess.
+_REPO_ROOT = Path(__file__).resolve().parent
 
 
 # ---------------------------------------------------------------------------
@@ -84,113 +117,22 @@ class _ToolLeakScrubber:
 # ---------------------------------------------------------------------------
 
 class FridayAgent(Agent):
-    """F.R.I.D.A.Y. voice agent. Tools registered directly — no MCP needed."""
+    """F.R.I.D.A.Y. voice agent. Tools come from the local MCP server
+    (see server.py + friday/tools/). This class keeps voice-specific
+    concerns: speaker gating, history trimming, streaming signals, greeting."""
 
     def __init__(self, stt, llm, tts, vad=None) -> None:
         super().__init__(
             instructions=SYSTEM_PROMPT,
             stt=stt, llm=llm, tts=tts,
             vad=vad or silero.VAD.load(
-                activation_threshold=0.92,
-                min_speech_duration=0.5,
+                # Bumped from 0.92 / 0.5 to filter out background chatter,
+                # typing, distant voices, brief noises during a session.
+                activation_threshold=0.95,
+                min_speech_duration=0.7,
                 min_silence_duration=0.8,
             ),
         )
-
-    # -- Direct tools (no MCP, no SSE, no timeouts) -------------------------
-
-    @agents.function_tool
-    async def get_current_time(self, timezone: str = "") -> str:
-        """Get the current date and time. If no timezone is given, automatically
-        detects the user's location via IP geolocation. You can also pass a
-        specific IANA timezone like 'America/New_York', 'Europe/London', etc.
-        For US states: Georgia/Florida/New York = America/New_York,
-        Texas/Illinois = America/Chicago, California = America/Los_Angeles.
-        Use this whenever the user asks what time it is."""
-        from datetime import datetime
-        from zoneinfo import ZoneInfo
-        import httpx
-
-        location_info = ""
-
-        if not timezone:
-            # Auto-detect from IP geolocation
-            try:
-                async with httpx.AsyncClient(timeout=5) as client:
-                    resp = await client.get("http://ip-api.com/json/?fields=city,regionName,country,timezone")
-                    data = resp.json()
-                    timezone = data.get("timezone", "UTC")
-                    city = data.get("city", "")
-                    region = data.get("regionName", "")
-                    country = data.get("country", "")
-                    location_info = f" (detected location: {city}, {region}, {country})"
-            except Exception:
-                timezone = "UTC"
-                location_info = " (location detection failed, using UTC)"
-
-        try:
-            tz = ZoneInfo(timezone)
-            now = datetime.now(tz)
-            return now.strftime("%A, %B %d, %Y at %I:%M %p %Z") + location_info
-        except Exception as e:
-            now = datetime.now()
-            return f"(Could not resolve timezone '{timezone}': {e}) Local time is {now.strftime('%I:%M %p')}."
-
-    @agents.function_tool
-    async def search_web(self, query: str) -> str:
-        """Search the web for current information on any topic.
-        Use this when the user asks about a specific event, person, conflict,
-        or anything that needs up-to-date information beyond general news headlines."""
-        from ddgs import DDGS
-
-        def _search():
-            try:
-                with DDGS() as ddgs:
-                    results = list(ddgs.text(query, max_results=5))
-                if not results:
-                    return "No results found for that query."
-                lines = []
-                for r in results:
-                    title = r.get("title", "")
-                    body = r.get("body", "")
-                    if body:
-                        lines.append(f"{title}: {body[:150]}")
-                    else:
-                        lines.append(title)
-                return " | ".join(lines)
-            except Exception as e:
-                return f"Search failed: {str(e)}"
-
-        return await asyncio.get_event_loop().run_in_executor(None, _search)
-
-    @agents.function_tool
-    async def get_world_news(self) -> str:
-        """Fetches the latest global headlines from major news outlets simultaneously.
-        Use this when the user asks 'What's going on in the world?' or for recent events."""
-        import httpx
-
-        async with httpx.AsyncClient(follow_redirects=True, timeout=10) as client:
-            tasks = [fetch_and_parse_feed(client, url) for url in SEED_FEEDS]
-            results_of_lists = await asyncio.gather(*tasks)
-            all_articles = [item for sublist in results_of_lists for item in sublist]
-
-        if not all_articles:
-            return "The global news grid is unresponsive. Unable to pull headlines."
-
-        lines = []
-        for entry in all_articles[:5]:
-            lines.append(f"{entry['title']}.")
-        return "Here are today's top stories. " + " ".join(lines)
-
-    @agents.function_tool
-    async def open_world_monitor(self) -> str:
-        """Opens the World Monitor dashboard (worldmonitor.app) in the system's web browser.
-        Use this when the user wants a visual overview of global events or a real-time map."""
-        try:
-            webbrowser.open("https://worldmonitor.app/")
-            return "Opening the World Monitor for you now."
-        except Exception as e:
-            return f"Unable to open the monitor: {str(e)}"
 
     # -- Speaker-gated STT ------------------------------------------------
 
@@ -246,7 +188,24 @@ class FridayAgent(Agent):
         if MAX_HISTORY_ITEMS and len(chat_ctx.items) > MAX_HISTORY_ITEMS:
             chat_ctx = chat_ctx.truncate(max_items=MAX_HISTORY_ITEMS)
 
-        # Signal the launcher that we're thinking
+        # -------------------------------------------------------------------
+        # Phase 0.5: Task Orchestration Routing
+        # -------------------------------------------------------------------
+        from friday.tasking import classify_request, start_task
+        from livekit.agents.llm import ChatChunk, ChoiceDelta
+        
+        if chat_ctx.items and chat_ctx.items[-1].role == "user":
+            latest_text = chat_ctx.items[-1].content
+            if isinstance(latest_text, str) and classify_request(latest_text) == "task":
+                logger.info(f"Task mode triggered for: {latest_text}")
+                start_task(latest_text)
+                
+                # Signal speaking state
+                print("SPEAKING", flush=True)
+                yield ChatChunk(delta=ChoiceDelta(role="assistant", content="Working on it in the background."))
+                return
+
+        # Signal the launcher that we're thinking for standard fast queries
         print("PROCESSING", flush=True)
 
         use_scrubber = LLM_PROVIDER in ("groq", "ollama")
@@ -290,23 +249,12 @@ class FridayAgent(Agent):
     # -- Greeting ---------------------------------------------------------
 
     async def on_enter(self) -> None:
-        logger.info("on_enter — generating greeting")
-        from datetime import datetime
-        now = datetime.now().strftime("%A, %I:%M %p")
-        try:
-            await self.session.generate_reply(
-                instructions=(
-                    f"It is currently {now}. "
-                    "Say a quick, casual greeting — one short sentence, "
-                    "like 'Hey, what's up?' or 'Hey Shiv, what do you need?'. "
-                    "Keep it natural. Do NOT call any tools. "
-                    "Do NOT mention the day or time unless it's relevant."
-                ),
-                tool_choice="none",
-            )
-            logger.info("on_enter greeting completed")
-        except Exception as e:
-            logger.exception("on_enter failed: %s", e)
+        # Intentionally silent. Greetings are fired from the activation loop
+        # in entrypoint() on each START — this lets us pre-start the session
+        # during boot (paying VAD load + connection setup up-front) without
+        # the agent speaking into an empty room. Result: first "hey jarvis"
+        # feels as snappy as re-activation.
+        logger.info("on_enter — session attached (greeting deferred to activation)")
 
 
 # ---------------------------------------------------------------------------
@@ -329,38 +277,75 @@ async def _wait_for_stdin_command() -> str:
             return cmd
 
 
+_GREETING_INSTRUCTIONS = (
+    "Say a quick, casual greeting — one short sentence, "
+    "like 'Hey, what's up?' or 'Hi sir, what do you need?'. "
+    "Keep it natural. Do NOT call any tools. "
+    "Do NOT mention the day or time unless it's relevant."
+)
+
+
+async def _fire_greeting(session) -> None:
+    """Generate the activation greeting on the already-running session."""
+    from datetime import datetime
+    now = datetime.now().strftime("%A, %I:%M %p")
+    try:
+        await session.generate_reply(
+            instructions=f"It is currently {now}. {_GREETING_INSTRUCTIONS}",
+            tool_choice="none",
+        )
+        logger.info("Greeting completed")
+    except Exception as e:
+        logger.warning("Greeting failed: %s", e)
+
+
 async def entrypoint(ctx: JobContext) -> None:
-    """Boot once, create a single persistent session, loop activations.
+    """Boot once, pre-start the session, then loop activations.
+
+    Key timing choice: the LiveKit session is started BEFORE we announce
+    FRIDAY_READY to the launcher. That front-loads the VAD load +
+    room connection cost (~2s) into boot, so the first "hey jarvis"
+    after launch is as fast as a re-activation. We keep the mic
+    disabled on the session until the user actually wakes the agent,
+    so no transcripts reach the LLM during the idle wait.
 
     Console mode's virtual room doesn't recover after session.aclose(),
     so we keep ONE session alive for the entire process lifetime.
     On dismissal we just signal the launcher (SESSION_DONE) without
-    tearing down the session. On re-activation we generate a fresh
-    greeting on the same live session.
+    tearing down the session. On re-activation we re-enable audio
+    and generate a fresh greeting on the same live session.
     """
     logger.info("FRIDAY online — room: %s | STT=%s | LLM=%s | TTS=%s",
                 ctx.room.name, STT_PROVIDER, LLM_PROVIDER, TTS_PROVIDER)
 
-    # Warm-up: verify config, trigger heavy imports, pre-load models
-    build_stt(); build_llm(); build_tts()
-    get_speaker_gate()
-    logger.info("All providers validated — entering session loop")
-    print("FRIDAY_READY", flush=True)
+    # Warm-up: build providers + speaker gate in parallel. Each factory
+    # is a plain synchronous constructor call with no shared state, so
+    # running them through the default thread pool is safe and shaves a
+    # second or two off boot time.
+    loop = asyncio.get_event_loop()
+    stt_inst, llm_inst, tts_inst, _ = await asyncio.gather(
+        loop.run_in_executor(None, build_stt),
+        loop.run_in_executor(None, build_llm),
+        loop.run_in_executor(None, build_tts),
+        loop.run_in_executor(None, get_speaker_gate),
+    )
+    logger.info("Providers + speaker gate warm — preparing session")
 
-    # ---- Wait for first START ----
-    logger.info("Waiting for START command on stdin…")
-    cmd = await _wait_for_stdin_command()
-    if cmd != "START":
-        logger.info("Received %r — shutting down", cmd or "EOF")
-        ctx.shutdown("stdin closed")
-        return
-
-    # ---- Create ONE persistent session ----
-    stt_inst = build_stt()
-    llm_inst = build_llm()
-    tts_inst = build_tts()
-
-    logger.info("START received — creating persistent session")
+    # Spawn the local MCP server as a stdio subprocess and wrap it in a
+    # toolset. This is the single source of truth for tools (see server.py
+    # + friday/tools/). Stdio keeps everything in-process-tree — no port,
+    # no URL, no network hop. The session closes the toolset on aclose(),
+    # which closes the underlying MCP subprocess.
+    mcp_toolset = MCPToolset(
+        id="friday-local",
+        mcp_server=MCPServerStdio(
+            command=sys.executable,
+            args=[str(_REPO_ROOT / "server.py")],
+            cwd=str(_REPO_ROOT),
+            client_session_timeout_seconds=15,
+        ),
+    )
+    logger.info("MCP stdio toolset prepared (%s)", _REPO_ROOT / "server.py")
 
     session = AgentSession(
         turn_handling=TurnHandlingOptions(
@@ -378,11 +363,34 @@ async def entrypoint(ctx: JobContext) -> None:
                 false_interruption_timeout=3.0,
             ),
         ),
+        tools=[mcp_toolset],
         max_tool_steps=3,
     )
 
-    # Dismissal event — set when the user says goodbye, cleared on re-activation
+    # -----------------------------------------------------------------------
+    # Phase 0.5: Task Orchestration Setup
+    # -----------------------------------------------------------------------
+    from friday.tasking import register_toolset, start_worker, set_completion_callback
+    register_toolset(mcp_toolset)
+    start_worker()
+    
+    async def _on_task_finished(task):
+        try:
+            logger.info(f"Task {task.task_id} completed. Narrating summary.")
+            await session.generate_reply(
+                instructions=f"The background task finished. Speak the following summary exactly in a natural tone, do not list steps or add extra flair: '{task.final_summary}'",
+                tool_choice="none",
+            )
+        except Exception as e:
+            logger.error(f"Task completion callback failed: {e}")
+            
+    set_completion_callback(_on_task_finished)
+
+    # Dismissal event — set when the user says goodbye, cleared on re-activation.
+    # Start in "dismissed" state so the activation loop's first iteration
+    # waits for a START command instead of immediately looping.
     dismissed = asyncio.Event()
+    dismissed.set()
 
     @session.on("user_input_transcribed")
     def _on_user_transcript(ev):
@@ -405,53 +413,58 @@ async def entrypoint(ctx: JobContext) -> None:
                     await handle.wait_for_playout()
                 except Exception:
                     await asyncio.sleep(2.5)
+                # Detach the mic from the session so STT stops consuming audio
+                # while we're sleeping. Without this, mic audio keeps flowing
+                # through STT → LLM and the agent re-engages itself ~minutes
+                # later. Re-enabled below on next START.
+                try:
+                    session.input.set_audio_enabled(False)
+                    logger.info("Audio input disabled — going quiet")
+                except Exception as e:
+                    logger.warning("Failed to disable audio input: %s", e)
                 logger.info("Sign-off complete")
                 dismissed.set()
 
             asyncio.create_task(_sign_off())
 
-    # Start the session ONCE — it stays alive for the whole process
+    # Pre-start the session so VAD + room connection is warm before the
+    # first "hey jarvis". Silence the mic immediately — we don't want
+    # transcripts landing in the LLM before the user actually wakes it.
     await session.start(
         agent=FridayAgent(stt=stt_inst, llm=llm_inst, tts=tts_inst),
         room=ctx.room,
     )
-    print("SESSION_STARTED", flush=True)
-    logger.info("Session active — listening for user speech")
+    try:
+        session.input.set_audio_enabled(False)
+    except Exception as e:
+        logger.warning("Failed to pre-disable audio input: %s", e)
+    logger.info("Session pre-warmed, audio gated off — awaiting first START")
+    print("FRIDAY_READY", flush=True)
 
-    # ---- Activation loop ----
+    # ---- Activation loop (first START + every subsequent one use the same path) ----
     while True:
-        # Wait for dismissal
-        await dismissed.wait()
-        print("SESSION_DONE", flush=True)
-        logger.info("Dismissed — waiting for next activation")
-
-        # Wait for next START from launcher
+        logger.info("Waiting for START command on stdin…")
         cmd = await _wait_for_stdin_command()
         if cmd != "START":
             logger.info("Received %r — shutting down", cmd or "EOF")
             break
 
-        # Re-activate: clear dismissal, generate a fresh greeting
-        dismissed.clear()
-        logger.info("Re-activated — generating greeting")
-        print("SESSION_STARTED", flush=True)
-
+        # Activate: enable mic, clear dismissal, announce, greet.
         try:
-            from datetime import datetime
-            now = datetime.now().strftime("%A, %I:%M %p")
-            await session.generate_reply(
-                instructions=(
-                    f"It is currently {now}. "
-                    "Say a quick, casual greeting — one short sentence, "
-                    "like 'Hey, what's up?' or 'Hey Shiv, what do you need?'. "
-                    "Keep it natural. Do NOT call any tools. "
-                    "Do NOT mention the day or time unless it's relevant."
-                ),
-                tool_choice="none",
-            )
-            logger.info("Re-activation greeting completed")
+            session.input.set_audio_enabled(True)
+            logger.info("Audio input enabled")
         except Exception as e:
-            logger.warning("Re-activation greeting failed: %s", e)
+            logger.warning("Failed to enable audio input: %s", e)
+        dismissed.clear()
+        print("SESSION_STARTED", flush=True)
+        logger.info("Activated — generating greeting")
+
+        await _fire_greeting(session)
+
+        # Wait for dismissal, then loop back for the next START.
+        await dismissed.wait()
+        print("SESSION_DONE", flush=True)
+        logger.info("Dismissed — waiting for next activation")
 
     # Clean up
     try:
