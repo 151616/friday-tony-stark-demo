@@ -126,3 +126,33 @@ def register(mcp):
             return "Opening the World Monitor for you now."
         except Exception as e:
             return f"I'm unable to initialize the visual monitor: {str(e)}"
+            
+    @mcp.tool()
+    def create_document(doc_type: str) -> str:
+        """
+        Creates a new web-based document by opening its associated shortcut URL.
+        Use this when the user says "new slide", "fresh doc", "create a spreadsheet", or "new code repo".
+        Types should be strings like "slide", "doc", "sheet", or "repo".
+        """
+        import os
+        doc_type = doc_type.lower()
+        mapping = {
+            "slide": "https://slides.new",
+            "slides": "https://slides.new",
+            "presentation": "https://slides.new",
+            "doc": "https://docs.new",
+            "document": "https://docs.new",
+            "word": "https://docs.new",
+            "sheet": "https://sheets.new",
+            "spreadsheet": "https://sheets.new",
+            "excel": "https://sheets.new",
+            "repo": "https://repo.new",
+            "repository": "https://repo.new"
+        }
+        
+        target = mapping.get(doc_type, "https://docs.new") # Default to doc
+        try:
+            os.startfile(target)
+            return f"Opening a new {doc_type} for you in the browser."
+        except Exception as e:
+            return f"Failed to create document: {str(e)}"

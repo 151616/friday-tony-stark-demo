@@ -14,6 +14,9 @@ dependencies = [
     "pyaudio",
     "livekit-api",
     "pytest",
+    "ddgs",          # web search backend used by search_web tool
+    "keyboard",      # global hotkeys (kill switch, restart)
+    "resemblyzer",   # speaker verification
 ]
 
 [project.scripts]
