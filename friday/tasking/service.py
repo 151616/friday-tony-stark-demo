@@ -50,7 +50,15 @@ def start_task(goal: str, source: str = "voice") -> str:
         steps=[]
     )
     create_task(task)
-    _TASK_QUEUE.put_nowait(task_id)
+
+    # Phase 6: Autonomous Visual Delegation
+    # Physically launch a detached background terminal window running our sub-routine.
+    import os
+    import sys
+    # Use 'start cmd /c' on Windows to pop open a visible terminal
+    cmd = f'start cmd /k "{sys.executable} -m friday.tasking.standalone_executor {task_id}"'
+    os.system(cmd)
+
     return task_id
 
 def get_task_status(task_id: str) -> TaskRecord | None:

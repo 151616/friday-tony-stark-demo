@@ -194,8 +194,15 @@ class FridayAgent(Agent):
         from friday.tasking import classify_request, start_task
         from livekit.agents.llm import ChatChunk, ChoiceDelta
         
-        if chat_ctx.items and chat_ctx.items[-1].role == "user":
-            latest_text = chat_ctx.items[-1].content
+        # Find the last user message — chat_ctx.items may end with
+        # FunctionCallOutput or other non-message items after tool use.
+        last_user = None
+        for item in reversed(chat_ctx.items):
+            if getattr(item, "role", None) == "user":
+                last_user = item
+                break
+        if last_user is not None:
+            latest_text = last_user.content
             if isinstance(latest_text, str) and classify_request(latest_text) == "task":
                 logger.info(f"Task mode triggered for: {latest_text}")
                 start_task(latest_text)
@@ -413,10 +420,6 @@ async def entrypoint(ctx: JobContext) -> None:
                     await handle.wait_for_playout()
                 except Exception:
                     await asyncio.sleep(2.5)
-                # Detach the mic from the session so STT stops consuming audio
-                # while we're sleeping. Without this, mic audio keeps flowing
-                # through STT → LLM and the agent re-engages itself ~minutes
-                # later. Re-enabled below on next START.
                 try:
                     session.input.set_audio_enabled(False)
                     logger.info("Audio input disabled — going quiet")
@@ -449,17 +452,24 @@ async def entrypoint(ctx: JobContext) -> None:
             logger.info("Received %r — shutting down", cmd or "EOF")
             break
 
-        # Activate: enable mic, clear dismissal, announce, greet.
-        try:
-            session.input.set_audio_enabled(True)
-            logger.info("Audio input enabled")
-        except Exception as e:
-            logger.warning("Failed to enable audio input: %s", e)
+        # Activate: clear dismissal, announce, greet, THEN enable mic.
+        # The mic must stay off during the greeting to prevent a race
+        # condition: if the user speaks while _fire_greeting()'s
+        # generate_reply() is still in-flight, LiveKit processes the
+        # speech as a new turn that conflicts with the greeting's LLM
+        # inference, causing dropped replies or AttributeErrors when
+        # llm_node() sees unexpected chat context items.
         dismissed.clear()
         print("SESSION_STARTED", flush=True)
-        logger.info("Activated — generating greeting")
+        logger.info("Activated — generating greeting (mic still gated)")
 
         await _fire_greeting(session)
+
+        try:
+            session.input.set_audio_enabled(True)
+            logger.info("Audio input enabled — listening for user speech")
+        except Exception as e:
+            logger.warning("Failed to enable audio input: %s", e)
 
         # Wait for dismissal, then loop back for the next START.
         await dismissed.wait()

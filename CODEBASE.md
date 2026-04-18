@@ -1,6 +1,6 @@
 # FRIDAY Codebase Reference
 
-Last rebuilt: 2026-04-15
+Last rebuilt: 2026-04-18
 
 This is the practical map of the repo. It favors current reality over aspirational architecture.
 
@@ -136,14 +136,31 @@ Why it matters:
 Home for all skills.
 
 Current modules:
-- `web.py` — `get_world_news`, `search_web`, `open_world_monitor`
+- `web.py` — `get_world_news`, `search_web`, `open_world_monitor`, `create_document`
 - `system.py` — `get_current_time`, `get_system_info`
 - `apps.py` — `launch_app`, `close_app`, `rescan_apps`
 - `utils.py` — `format_json`, `word_count`
+- `media.py` — `play_pause_media`, `next_track`, `previous_track`, `search_spotify`
+- `files.py` — `list_files`, `read_file`, `search_files` (bounded by `FRIDAY_FILE_ROOTS`)
+- `audio.py` — `recognize_song_humming` (Gemini multimodal, records mic then identifies)
+- `messaging.py` — `draft_message` (WhatsApp URI / Discord clipboard+open)
+- `google_suite.py` — `list_upcoming_events`, `list_recent_emails` (Google OAuth, read-only)
 
 Rule:
 - every tool lives here. No shadow definitions on `FridayAgent`.
 - add new modules to `friday/tools/__init__.py::register_all_tools`.
+
+### `friday/tasking/`
+
+Phase 0.5 task orchestration layer.
+
+- `models.py` — `TaskRecord` and `TaskStep` Pydantic models.
+- `store.py` — JSON persistence in `runtime/tasks/active/`.
+- `router.py` — `classify_request()` keyword heuristic (fast vs task).
+- `planner.py` — `plan_steps()` calls LLM in planner mode to build a step list.
+- `service.py` — `start_task()` entry point; launches `standalone_executor.py` in a CMD window.
+- `executor.py` — in-process executor (currently unused; `service.py` uses the CMD path instead).
+- `standalone_executor.py` — runs in the spawned CMD window; boots its own MCP connection and Gemini LLM, executes up to 15 tool steps, writes final_summary to task JSON.
 
 ---
 
@@ -259,7 +276,17 @@ Build a small Android or iOS companion app that owns Google Home auth and expose
 - `friday/tools/__init__.py`
 - `friday/tools/system.py`
 - `friday/tools/web.py`
-- `friday/tools/utils.py`
+- `friday/tools/apps.py`
+- `friday/tools/media.py`
+- `friday/tools/files.py`
+- `friday/tools/google_suite.py`
+
+### Task orchestration
+
+- `friday/tasking/service.py` — `start_task()` entry point
+- `friday/tasking/standalone_executor.py` — the visible CMD sub-routine
+- `friday/tasking/store.py` — task JSON persistence
+- `friday/tasking/router.py` — fast vs task classification
 
 ### Operational support
 
@@ -314,10 +341,12 @@ Logs:
 If the goal is "Jarvis, but still fast," the next engineering wins are:
 
 1. ~~Finish the MCP migration without regressing latency.~~ Done (2026-04-15).
-2. Add a minimal background task layer for slow tools (Phase 0.5).
-3. Add fast local tools before network-heavy skills.
-4. Put home-device control behind a local bridge.
-5. Keep spoken replies short unless the user explicitly asks for a long task result.
+2. ~~Add a minimal background task layer for slow tools (Phase 0.5).~~ Core shipped (2026-04-17).
+3. ~~Add fast local tools before network-heavy skills.~~ Media, files, apps all live in `friday/tools/`.
+4. **Wire the task completion callback.** `_on_task_finished` in `agent_friday.py` never fires today. Add a file-watcher loop to `service.py` that polls `runtime/tasks/active/` and calls the callback when a task JSON reaches `completed`.
+5. Put home-device control behind a local bridge (Phase 3 — Home Assistant).
+6. Phase 6b headless `ask_claude` once the callback is wired.
+7. Keep spoken replies short unless the user explicitly asks for a long task result.
 
 ---
 

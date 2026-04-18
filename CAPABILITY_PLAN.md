@@ -23,76 +23,83 @@ This is the single top-level to-do list for the project. The sections below expa
 
 1. ~~Finish Phase 0 MCP migration.~~ **Done (2026-04-15).**
 - ~~Connect `agent_friday.py` to the local MCP server.~~ Via `MCPServerStdio` + `MCPToolset` on `AgentSession(tools=[...])`.
-- ~~Move the seed tools to `friday/tools/` as the single source of truth.~~ Ten tools live in `friday/tools/{web,system,apps,utils}.py`. No `@agents.function_tool` on `FridayAgent` anymore.
+- ~~Move the seed tools to `friday/tools/` as the single source of truth.~~ Fourteen tools across `friday/tools/{web,system,apps,utils,media,files,audio,messaging,google_suite}.py`. No `@agents.function_tool` on `FridayAgent`.
 - ~~Keep current voice behavior and latency intact during the migration.~~ Stdio keeps MCP in-process-tree; no network hop.
+- ~~First-activation latency reduced.~~ Session pre-started before `FRIDAY_READY`; providers warm in parallel. (2026-04-18)
 
-2. Build Phase 0.5 planner mode and task orchestration.
-- Add task models, temporary task storage, router, planner, executor, and service layers.
-- Keep normal chat on the fast path.
-- Enable Gemini thinking only for complex tasks.
-- Execute long work step by step instead of blocking one reply.
+2. ~~Build Phase 0.5 planner mode and task orchestration.~~ **Core layer shipped (2026-04-17). One gap remains.**
+- ~~Task models, JSON store, router, planner, executor, service layers.~~ All in `friday/tasking/`.
+- ~~Keep normal chat on the fast path.~~ `classify_request()` routes fast vs task in `llm_node`.
+- ~~Enable Gemini thinking only for complex tasks.~~ `build_llm(mode="planner")` sets `thinking_budget=1024`.
+- ~~Visible sub-routine terminal.~~ `standalone_executor.py` opens a colored CMD window for each task.
+- **Gap — completion callback not wired:** `start_task()` uses `os.system()` to launch the CMD window, so the in-process `_on_task_finished` callback never fires. FRIDAY does not yet speak a summary when a task completes. Fix: add a file-watcher loop in `service.py` that polls task JSON files and calls the callback when status transitions to `completed`.
 
-3. Ship Phase 1 app launcher.
-- Add app whitelist config.
-- Add `launch_app` and `close_app`.
-- Demo opening and closing your main desktop apps by voice.
+3. ~~Ship Phase 1 app launcher.~~ **Done (2026-04-15 / enhanced 2026-04-17).**
+- ~~App whitelist + aliases in `friday/config.py`.~~ 10 pinned apps, aliases for spoken variants.
+- ~~`launch_app` and `close_app` via Start Menu discovery + UWP AppsFolder.~~ Auto-discovers everything installed.
+- ~~Demo opening and closing desktop apps by voice.~~
 
-4. Ship Phase 2 file read tools.
-- Add bounded file listing, reading, and search.
-- Enforce `FRIDAY_FILE_ROOTS`.
-- Keep responses short and spoken naturally.
+4. ~~Ship Phase 2 file read tools.~~ **Done (2026-04-17).**
+- ~~Bounded `list_files`, `read_file`, `search_files`.~~ All in `friday/tools/files.py`.
+- ~~Enforce `FRIDAY_FILE_ROOTS`.~~ Roots: repo folder, Documents, Downloads. Natural-language aliases accepted.
+- ~~Keep responses short and spoken naturally.~~ 50-item cap on listings, 20KB cap on reads.
 
 5. Ship Phase 3 home bridge.
 - Start with Home Assistant, not direct Google Home APIs.
 - Add room and device lookup, announcements, and basic media or volume control.
 - Keep Google Home and Nest as controllable endpoints, not microphones.
 
-6. Ship Phase 4 Spotify.
-- Add playback, search, pause, next, and previous.
-- Keep it fast enough to feel like a direct voice control feature.
+6. ~~Ship Phase 4 Spotify.~~ **Partially done (2026-04-17). Basic playback only.**
+- ~~Play/pause, next, previous via media keys.~~ `play_pause_media`, `next_track`, `previous_track` in `friday/tools/media.py`.
+- ~~Search and auto-play a track.~~ `search_spotify` finds a Spotify URI via DDGS and opens it via `spotify:track:` protocol — no API key needed.
+- **Still missing:** volume control, current-track query, queue management, playlist support.
 
-7. Ship Phase 5 Calendar and Gmail.
-- Add read-focused tools first.
-- Use quick acknowledgments before slower network calls.
-- Require confirmation before any destructive or sending action later.
+7. ~~Ship Phase 5 Calendar and Gmail.~~ **Partially done (2026-04-17). Needs OAuth setup.**
+- ~~Read-focused tools first.~~ `list_upcoming_events` and `list_recent_emails` in `friday/tools/google_suite.py`. Read-only OAuth scopes only.
+- **Requires:** `credentials.json` (Google Cloud OAuth client secret) in the repo root. First run opens a browser for auth; `token.json` is saved for subsequent runs.
+- **Still missing:** confirmation flow for any future write actions.
 
-8. Ship Phase 6 Claude delegation.
-- Two flavors, share the same task plumbing from Phase 0.5:
-  - 6a: visible terminal — open a Windows Terminal tab running `claude`, hand control back immediately (interactive work, pairing, long coding sessions).
-  - 6b: headless sub-agent — `ask_claude(prompt)` shells out `claude -p "<prompt>"`, runs as a background task, speaks the answer when done (delegated reasoning, "Friday, have Claude figure out X").
-- Return control to the user immediately after starting work.
-- Track the task instead of blocking the voice turn.
+8. ~~Ship Phase 6a — visible terminal sub-routine.~~ **Done (2026-04-17).**
+- `start_task(goal)` in `service.py` launches a CMD window running `standalone_executor.py`.
+- The terminal shows the Gemini planner's thinking and tool calls in real-time with ANSI color.
+- Task state (including `final_summary`) is saved to `runtime/tasks/active/<task_id>.json`.
+- **Still needed for 6b:** headless `ask_claude(prompt)` option that runs `claude -p` as a background task and speaks the answer. Depends on the completion-callback fix in item 2.
 
-9. Ship Phase 7 file write, move, and delete.
+9. **Extras shipped outside the original plan:**
+- `recognize_song_humming` — record mic audio and identify a song via Gemini multimodal. Trigger: "what am I humming" / "shazam this".
+- `create_document` (in `web.py`) — opens Google Slides, Docs, Sheets, or a new GitHub repo via shortcut URLs.
+- `draft_message` (in `messaging.py`) — prefills a WhatsApp URI or copies text to clipboard and opens Discord. Early Phase 8 work, not yet read-capable.
+
+10. Ship Phase 7 file write, move, and delete.
 - Reuse the confirmation system.
 - Keep all operations inside approved roots.
 - Log every action and result.
 
-10. Ship Phase 8 WhatsApp Web.
-- Use a browser automation path, not desktop pixel automation.
+11. Ship Phase 8 WhatsApp Web (full).
+- `draft_message` is a start, but read capability is missing.
+- Full version needs browser automation path, not just URI launch.
 - Keep the first version read-only.
-- Treat it as a later, more brittle integration.
 
-11. Ship Phase 9 shell with confirmation.
+12. Ship Phase 9 shell with confirmation.
 - Add strict command allowlists.
 - Run commands visibly.
 - Treat shell as task-mode work, not fast-path chat.
 
-12. Ship Phase 10 remote bridge.
+13. Ship Phase 10 remote bridge.
 - Expose FRIDAY through Telegram, Discord, or LAN.
 - Reuse the same tool and task surface.
 - Keep permissions and confirmation behavior consistent.
 
-13. Ship Phase 11 memory.
+14. Ship Phase 11 memory.
 - Add lightweight memory only after responsiveness is stable.
 - Store compact facts and preferences, not giant transcripts.
 - Keep memory out of the hot path unless it clearly improves the turn.
 
-14. Improve hardware only after the software path feels solid.
+15. Improve hardware only after the software path feels solid.
 - Use better mics for real-world reliability.
 - Do not treat Google Home devices as the hearing layer.
 
-15. Add observability and polish.
+16. Add observability and polish.
 - Keep audit logs useful.
 - Add task status visibility.
 - Preserve the "Jarvis" feel: quick acknowledgments, short spoken updates, minimal dead air.
@@ -616,16 +623,21 @@ and FRIDAY stays conversationally responsive instead of hanging on one long repl
 
 ## Architecture target
 
-### Current reality (post Phase 0)
+### Current reality (post Phase 0.5, 2026-04-18)
 
 - `agent_friday.py` connects to the local MCP server via `MCPServerStdio` + `MCPToolset`.
-- Every skill lives in `friday/tools/` and is registered through `server.py`.
+- Every skill lives in `friday/tools/` (14 tools across 9 modules) and is registered through `server.py`.
 - The agent has no `@agents.function_tool` methods — it's all MCP.
+- `llm_node` classifies each request via `router.classify_request()` before handing to the LLM. Task-mode requests immediately yield a short ack and launch a visible CMD sub-routine.
+- Session is pre-started before `FRIDAY_READY` with audio gated off, so first wake = re-activation speed.
+- Provider warmup is parallelised (`asyncio.gather` + thread pool).
 
-### Still to build
+### Known gaps to close next
 
-- Phase 0.5 task layer so long-running work doesn't block the voice turn.
-- External bridges (phone, Telegram, LAN) can attach to the same tool surface via `server.py --sse` or `--streamable-http`.
+- **Task completion callback** — `_on_task_finished` in `agent_friday.py` never fires because `start_task()` uses `os.system()` instead of the in-process queue. Add a file-watcher to detect when the standalone executor writes `"completed"` to the task JSON and call the callback.
+- **Phase 3 home bridge** — no Home Assistant integration yet.
+- **Phase 6b headless ask_claude** — every task is a visible CMD window right now; the quiet background path is not implemented.
+- External bridges (phone, Telegram, LAN) can attach to the same tool surface via `server.py --sse` or `--streamable-http` once the local surface is stable.
 
 ---
 
@@ -633,48 +645,32 @@ and FRIDAY stays conversationally responsive instead of hanging on one long repl
 
 This order is optimized for responsiveness, not maximum feature count.
 
-### Phase 0 - MCP migration
+### ~~Phase 0~~ — Done (2026-04-15)
 
-Move the live agent toward `server.py` so new capabilities do not require hand-editing `FridayAgent`.
+~~Move the live agent toward `server.py` so new capabilities do not require hand-editing `FridayAgent`.~~
 
-Exit criteria:
-- The agent can consume tools from the local MCP server.
-- Existing seed tools still work.
-- New tools have one home: `friday/tools/`.
+All done. 14 MCP tools, no `@agents.function_tool` on the agent. First-activation latency also improved.
 
-### Phase 0.5 - Task model for slow work
+### ~~Phase 0.5~~ — Core shipped (2026-04-17); completion callback gap remains
 
-Add a minimal task layer before expanding slow integrations.
+~~Add a minimal task layer before expanding slow integrations.~~
 
-Needed behavior:
-- `start_task(...)` style abstraction for long-running jobs.
-- Immediate spoken acknowledgment.
-- Optional progress callbacks.
-- Later completion summary.
-- Temporary structured task state that FRIDAY can read and update between steps.
-- Planner mode that can enable Gemini thinking only for complex tasks.
-- Step-by-step execution instead of one long blocking response.
+What's working:
+- `friday/tasking/` package: models, store, router, planner, service, executor, standalone_executor.
+- `classify_request()` routes in `llm_node`. Task requests get an immediate ack + visible CMD sub-routine.
+- `build_llm(mode="planner")` enables thinking for the sub-routine.
 
-This is what keeps Jarvis natural instead of silent while waiting for one big answer.
+Gap: the `_on_task_finished` callback in `agent_friday.py` never fires because `start_task()` bypasses the in-process queue. FRIDAY doesn't speak a completion summary. To fix: convert the `_worker_loop` in `service.py` into a file-watcher that polls `runtime/tasks/active/` and triggers the callback when a task JSON transitions to `completed`.
 
-Recommended shape:
-- `fast` path for normal chat and quick tools
-- `task` path for long workflows
-- planner creates a short step list
-- executor runs one step at a time
-- task record is discarded on completion
+### ~~Phase 1~~ — Done (2026-04-15, enhanced 2026-04-17)
 
-This should be built as explicit orchestration, not as "let the model keep a hidden diary." The model can help plan, but the task state must live outside the model.
+~~App launcher with whitelist, aliases, Start Menu discovery, and UWP AppsFolder support.~~
 
-### Phase 1 - App launcher
+### ~~Phase 2~~ — Done (2026-04-17)
 
-Low-latency, high-demo-value, easy to trust.
+~~Bounded file listing, reading, and search inside `FRIDAY_FILE_ROOTS`.~~
 
-### Phase 2 - File read tools
-
-Still fast, still bounded, very useful in day-to-day use.
-
-### Phase 3 - Home bridge
+### Phase 3 — Home bridge
 
 Do Home Assistant before chasing deeper Google-specific work.
 
@@ -683,24 +679,23 @@ Why early:
 - It is mostly local.
 - It fits the "fast action" interaction pattern.
 
-### Phase 4 - Spotify
+### ~~Phase 4~~ — Basic playback done (2026-04-17); deeper Spotify features remain
 
-Natural voice demo, low-risk, good wow factor.
+~~Natural voice demo, low-risk, good wow factor.~~
 
-### Phase 5 - Calendar and Gmail
+Play/pause/skip and URI-based track search work. Volume, current-track query, and queue management are not yet implemented.
 
-Useful, but network-bound and slightly slower. These should use quick acknowledgments before tool completion.
+### ~~Phase 5~~ — Read-only shipped (2026-04-17); needs credentials.json
 
-### Phase 6 - Claude delegation
+~~Calendar and Gmail read-focused tools via Google OAuth.~~
 
-Excellent for task-mode workflows. Do not block the voice turn waiting for Claude to finish.
+`list_upcoming_events` and `list_recent_emails` work once `credentials.json` is placed in the repo root. First run triggers a browser OAuth flow.
 
-Two variants, built on the same Phase 0.5 task layer:
+### Phase 6 — Claude delegation
 
-- **6a — visible terminal.** `open_claude_cli()` opens a Windows Terminal tab and starts `claude`. Friday acks and returns control. Best for pairing, interactive coding, "I want to see what Claude is doing."
-- **6b — headless sub-agent.** `ask_claude(prompt)` shells `claude -p "<prompt>"` as a background task, streams or captures the result, and speaks a short summary on completion. Best for "Friday, have Claude figure out X" style delegation where Shiv doesn't need to see the terminal. Must use the task model — Claude CLI calls can take 10s+.
+~~6a (visible terminal) done.~~ The `standalone_executor.py` is the Gemini-based visible terminal sub-routine. Any task-mode request opens a CMD window.
 
-Both depend on `claude` being on PATH. 6b additionally depends on the task layer from Phase 0.5.
+**6b (headless Claude CLI)** is still to build. `ask_claude(prompt)` would shell `claude -p "<prompt>"` as a truly background task and speak the result on completion. Depends on the Phase 0.5 completion-callback fix.
 
 ### Phase 7 - File write / move / delete
 

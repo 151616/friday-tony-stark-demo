@@ -17,6 +17,10 @@ dependencies = [
     "ddgs",          # web search backend used by search_web tool
     "keyboard",      # global hotkeys (kill switch, restart)
     "resemblyzer",   # speaker verification
+    "google-api-python-client>=2.0.0",
+    "google-auth-httplib2>=0.1.0",
+    "google-auth-oauthlib>=1.0.0",
+    "python-dateutil",
 ]
 
 [project.scripts]
