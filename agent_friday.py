@@ -188,31 +188,7 @@ class FridayAgent(Agent):
         if MAX_HISTORY_ITEMS and len(chat_ctx.items) > MAX_HISTORY_ITEMS:
             chat_ctx = chat_ctx.truncate(max_items=MAX_HISTORY_ITEMS)
 
-        # -------------------------------------------------------------------
-        # Phase 0.5: Task Orchestration Routing
-        # -------------------------------------------------------------------
-        from friday.tasking import classify_request, start_task
-        from livekit.agents.llm import ChatChunk, ChoiceDelta
-        
-        # Find the last user message — chat_ctx.items may end with
-        # FunctionCallOutput or other non-message items after tool use.
-        last_user = None
-        for item in reversed(chat_ctx.items):
-            if getattr(item, "role", None) == "user":
-                last_user = item
-                break
-        if last_user is not None:
-            latest_text = last_user.content
-            if isinstance(latest_text, str) and classify_request(latest_text) == "task":
-                logger.info(f"Task mode triggered for: {latest_text}")
-                start_task(latest_text)
-                
-                # Signal speaking state
-                print("SPEAKING", flush=True)
-                yield ChatChunk(delta=ChoiceDelta(role="assistant", content="Working on it in the background."))
-                return
-
-        # Signal the launcher that we're thinking for standard fast queries
+        # Signal the launcher that we're thinking
         print("PROCESSING", flush=True)
 
         use_scrubber = LLM_PROVIDER in ("groq", "ollama")
@@ -420,11 +396,6 @@ async def entrypoint(ctx: JobContext) -> None:
                     await handle.wait_for_playout()
                 except Exception:
                     await asyncio.sleep(2.5)
-                try:
-                    session.input.set_audio_enabled(False)
-                    logger.info("Audio input disabled — going quiet")
-                except Exception as e:
-                    logger.warning("Failed to disable audio input: %s", e)
                 logger.info("Sign-off complete")
                 dismissed.set()
 
@@ -452,29 +423,26 @@ async def entrypoint(ctx: JobContext) -> None:
             logger.info("Received %r — shutting down", cmd or "EOF")
             break
 
-        # Activate: clear dismissal, announce, greet, THEN enable mic.
-        # The mic must stay off during the greeting to prevent a race
-        # condition: if the user speaks while _fire_greeting()'s
-        # generate_reply() is still in-flight, LiveKit processes the
-        # speech as a new turn that conflicts with the greeting's LLM
-        # inference, causing dropped replies or AttributeErrors when
-        # llm_node() sees unexpected chat context items.
+        # Re-activate: clear dismissal, generate a fresh greeting
         dismissed.clear()
         print("SESSION_STARTED", flush=True)
-        logger.info("Activated — generating greeting (mic still gated)")
-
-        await _fire_greeting(session)
 
         try:
-            session.input.set_audio_enabled(True)
-            logger.info("Audio input enabled — listening for user speech")
+            from datetime import datetime
+            now = datetime.now().strftime("%A, %I:%M %p")
+            await session.generate_reply(
+                instructions=(
+                    f"It is currently {now}. "
+                    "Say a quick, casual greeting — one short sentence, "
+                    "like 'Hey, what's up?' or 'Hey Shiv, what do you need?'. "
+                    "Keep it natural. Do NOT call any tools. "
+                    "Do NOT mention the day or time unless it's relevant."
+                ),
+                tool_choice="none",
+            )
+            logger.info("Re-activation greeting completed")
         except Exception as e:
-            logger.warning("Failed to enable audio input: %s", e)
-
-        # Wait for dismissal, then loop back for the next START.
-        await dismissed.wait()
-        print("SESSION_DONE", flush=True)
-        logger.info("Dismissed — waiting for next activation")
+            logger.warning("Re-activation greeting failed: %s", e)
 
     # Clean up
     try:

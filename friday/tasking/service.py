@@ -38,7 +38,7 @@ def start_worker():
 def start_task(goal: str, source: str = "voice") -> str:
     """Creates a new TaskRecord and pushes it onto the executor queue."""
     task_id = f"task_{datetime.now().strftime('%Y%m%d')}_{uuid4().hex[:6]}"
-    
+
     task = TaskRecord(
         task_id=task_id,
         goal=goal,
