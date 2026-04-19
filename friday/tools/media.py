@@ -1,4 +1,6 @@
 """Media control tool."""
+import ctypes
+import ctypes.wintypes
 import os
 import keyboard
 import urllib.parse
@@ -36,6 +38,42 @@ def _set_app_volume(app_name: str, level: float) -> str:
     finally:
         CoUninitialize()
 
+def _get_spotify_window_title() -> str | None:
+    """Read the Spotify window title. Returns 'Artist - Track' when playing,
+    or None if Spotify isn't running or nothing is playing."""
+    EnumWindows = ctypes.windll.user32.EnumWindows
+    GetWindowTextW = ctypes.windll.user32.GetWindowTextW
+    GetWindowTextLengthW = ctypes.windll.user32.GetWindowTextLengthW
+    IsWindowVisible = ctypes.windll.user32.IsWindowVisible
+
+    titles = []
+
+    def callback(hwnd, _):
+        if IsWindowVisible(hwnd):
+            length = GetWindowTextLengthW(hwnd)
+            if length > 0:
+                buf = ctypes.create_unicode_buffer(length + 1)
+                GetWindowTextW(hwnd, buf, length + 1)
+                title = buf.value
+                # Spotify window class is Chrome_WidgetWin_1;
+                # match by title containing known Spotify patterns.
+                if title and ("Spotify" in title or "spotify" in title):
+                    titles.append(title)
+        return True
+
+    WNDENUMPROC = ctypes.WINFUNCTYPE(
+        ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM
+    )
+    EnumWindows(WNDENUMPROC(callback), 0)
+
+    # Filter out generic titles (nothing playing).
+    idle_titles = {"Spotify", "Spotify Free", "Spotify Premium"}
+    for t in titles:
+        if t not in idle_titles and " - " in t:
+            return t  # "Artist - Track"
+    return None
+
+
 def register(mcp: FastMCP):
 
     @mcp.tool(name="set_volume")
@@ -66,6 +104,17 @@ def register(mcp: FastMCP):
         keyboard.send("previous track")
         return "Went to previous track."
         
+    @mcp.tool(name="current_track")
+    def current_track() -> str:
+        """Get the currently playing track from Spotify.
+        Use when the user asks 'what's playing', 'what song is this',
+        or 'what's the current track'."""
+        title = _get_spotify_window_title()
+        if title:
+            # Title format is "Artist - Track Name"
+            return f"Now playing: {title}."
+        return "Nothing is playing on Spotify right now."
+
     @mcp.tool(name="search_spotify")
     async def search_spotify(query: str, type: str = "track") -> str:
         """Search Spotify and instantly auto-play a track, playlist, or album.

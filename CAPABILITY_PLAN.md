@@ -638,7 +638,7 @@ and FRIDAY stays conversationally responsive instead of hanging on one long repl
 
 - ~~Task completion callback~~ — Done (2026-04-19). File-watcher polls task JSONs and fires `_on_task_finished`.
 - **Phase 3 home bridge** — no Home Assistant integration yet.
-- **Phase 6b headless ask_claude** — every task is a visible CMD window right now; the quiet background path is not implemented. Now unblocked by the completion callback fix.
+- ~~Phase 6b headless ask_claude~~ — Done (2026-04-19). `ask_claude` tool delegates to Claude CLI in background.
 - **Phase 7 file write/move/delete** — confirmation flow needed first.
 - External bridges (phone, Telegram, LAN) can attach to the same tool surface via `server.py --sse` or `--streamable-http` once the local surface is stable.
 
@@ -697,7 +697,7 @@ Play/pause/skip and URI-based track search work. Volume, current-track query, an
 
 ~~6a (visible terminal) done.~~ The `standalone_executor.py` is the Gemini-based visible terminal sub-routine. Any task-mode request opens a CMD window.
 
-**6b (headless Claude CLI)** is still to build. `ask_claude(prompt)` would shell `claude -p "<prompt>"` as a truly background task and speak the result on completion. Depends on the Phase 0.5 completion-callback fix.
+~~6b (headless Claude CLI) done (2026-04-19).~~ `ask_claude(prompt)` in `friday/tools/claude_delegate.py` runs `claude -p` in a background thread, writes the result to a task JSON, and the file-watcher fires the completion callback so FRIDAY speaks the answer.
 
 ### Phase 7 - File write / move / delete
 
