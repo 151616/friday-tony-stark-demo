@@ -121,7 +121,7 @@ _log_fmt = logging.Formatter(
     "%(asctime)s [%(name)s] %(levelname)s: %(message)s"
 )
 _file_handler = logging.handlers.RotatingFileHandler(
-    LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+    LOG_FILE, maxBytes=2 * 1024 * 1024, backupCount=2, encoding="utf-8"
 )
 _file_handler.setFormatter(_log_fmt)
 _console_handler = logging.StreamHandler()
@@ -130,6 +130,7 @@ _console_handler.setFormatter(_log_fmt)
 logging.basicConfig(
     level=logging.INFO,
     handlers=[_file_handler, _console_handler],
+    force=True,           # clear any pre-existing root handlers
 )
 logger = logging.getLogger("friday-launcher")
 
@@ -394,6 +395,7 @@ class AgentProcess:
             env=env,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,   # merge stderr into stdout pipe — prevents double-logging
             bufsize=1,
             encoding="utf-8",
             errors="replace",
@@ -419,6 +421,24 @@ class AgentProcess:
         )
         self._reader_thread.start()
 
+    # Substrings in agent stdout lines that are too noisy to log.
+    _NOISE_PATTERNS = (
+        "Processing VAD event",
+        "START_SPEECH",
+        "END_SPEECH",
+        "Speech started",
+        "Speech ended",
+        "flush triggered",
+        "flush message",
+        "Sent ",              # "Sent 1100 audio chunks"
+        "empty transcript",
+        "audio chunks",
+        "signal_type",
+        "client_request_id",
+        "server_request_id",
+        "connection_state",
+    )
+
     def _read_stdout(self):
         """Drain subprocess stdout, dispatch signals, echo everything else."""
         try:
@@ -440,9 +460,10 @@ class AgentProcess:
                     if self._on_speaking:
                         self._on_speaking()
                 elif stripped:
-                    # Echo to console (visible if we have one) AND log file
-                    # via the agent-tagged logger, so silent runs are debuggable.
-                    print(stripped, flush=True)
+                    # Skip noisy LiveKit SDK internal debug lines.
+                    if any(p in stripped for p in self._NOISE_PATTERNS):
+                        continue
+                    # Log via the agent-tagged logger (goes to file + console).
                     logging.getLogger("friday-agent").info(stripped)
         except Exception as e:
             logger.debug("stdout reader error: %s", e)

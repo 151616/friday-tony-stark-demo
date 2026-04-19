@@ -6,37 +6,75 @@ from uuid import uuid4
 
 from .models import TaskRecord
 from .store import create_task, load_task
-from .executor import execute_task, set_completion_callback
+from .executor import set_completion_callback
 
 logger = logging.getLogger("friday-agent")
 
-_TASK_QUEUE = asyncio.Queue()
 _GLOBAL_TOOLSET = None
-_WORKER_TASK = None
+_WATCHER_TASK = None
+
+# Track tasks we've launched so the file-watcher knows which to monitor,
+# and which have already had their callback fired.
+_TRACKED_TASKS: dict[str, str] = {}   # task_id → last-seen status
+
+_POLL_INTERVAL = 3.0  # seconds between file-system polls
 
 def register_toolset(toolset):
     """Register the MCP toolset so background executors can use it."""
     global _GLOBAL_TOOLSET
     _GLOBAL_TOOLSET = toolset
 
-async def _worker_loop():
+
+async def _file_watcher_loop():
+    """Poll task JSON files for status transitions to completed/failed.
+
+    The standalone executor (running in a separate CMD window) writes the
+    final status back to the JSON file.  This loop detects that change and
+    fires the completion callback so FRIDAY can speak the summary.
+    """
+    import inspect
+    from . import executor   # module ref so we always read the live _CALLBACK
+
     while True:
-        task_id = await _TASK_QUEUE.get()
+        await asyncio.sleep(_POLL_INTERVAL)
         try:
-            await execute_task(task_id, _GLOBAL_TOOLSET)
+            for task_id, prev_status in list(_TRACKED_TASKS.items()):
+                if prev_status in ("completed", "failed"):
+                    continue  # already handled
+
+                task = load_task(task_id)
+                if not task:
+                    continue
+
+                if task.status in ("completed", "failed"):
+                    _TRACKED_TASKS[task_id] = task.status
+                    logger.info("File-watcher: task %s → %s", task_id, task.status)
+
+                    cb = executor._CALLBACK
+                    if cb:
+                        try:
+                            if inspect.iscoroutinefunction(cb):
+                                await cb(task)
+                            else:
+                                cb(task)
+                        except Exception as e:
+                            logger.error("Task completion callback error for %s: %s",
+                                         task_id, e)
+                elif task.status != prev_status:
+                    _TRACKED_TASKS[task_id] = task.status
         except Exception as e:
-            logger.error(f"Task executor queue failed for {task_id}: {e}")
-        finally:
-            _TASK_QUEUE.task_done()
+            logger.error("File-watcher loop error: %s", e)
+
 
 def start_worker():
-    """Start the background orchestrator loop."""
-    global _WORKER_TASK
-    if _WORKER_TASK is None:
-        _WORKER_TASK = asyncio.create_task(_worker_loop())
+    """Start the background file-watcher loop."""
+    global _WATCHER_TASK
+    if _WATCHER_TASK is None:
+        _WATCHER_TASK = asyncio.create_task(_file_watcher_loop())
 
 def start_task(goal: str, source: str = "voice") -> str:
-    """Creates a new TaskRecord and pushes it onto the executor queue."""
+    """Creates a new TaskRecord, launches the standalone executor in a visible
+    CMD window, and registers it with the file-watcher for completion callback."""
     task_id = f"task_{datetime.now().strftime('%Y%m%d')}_{uuid4().hex[:6]}"
 
     task = TaskRecord(
@@ -51,11 +89,12 @@ def start_task(goal: str, source: str = "voice") -> str:
     )
     create_task(task)
 
-    # Phase 6: Autonomous Visual Delegation
-    # Physically launch a detached background terminal window running our sub-routine.
+    # Register with the file-watcher so we get a callback when done.
+    _TRACKED_TASKS[task_id] = "pending"
+
+    # Launch a detached visible terminal window running the standalone executor.
     import os
     import sys
-    # Use 'start cmd /c' on Windows to pop open a visible terminal
     cmd = f'start cmd /k "{sys.executable} -m friday.tasking.standalone_executor {task_id}"'
     os.system(cmd)
 

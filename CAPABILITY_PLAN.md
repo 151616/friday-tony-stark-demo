@@ -27,12 +27,12 @@ This is the single top-level to-do list for the project. The sections below expa
 - ~~Keep current voice behavior and latency intact during the migration.~~ Stdio keeps MCP in-process-tree; no network hop.
 - ~~First-activation latency reduced.~~ Session pre-started before `FRIDAY_READY`; providers warm in parallel. (2026-04-18)
 
-2. ~~Build Phase 0.5 planner mode and task orchestration.~~ **Core layer shipped (2026-04-17). One gap remains.**
+2. ~~Build Phase 0.5 planner mode and task orchestration.~~ **Done (2026-04-19).**
 - ~~Task models, JSON store, router, planner, executor, service layers.~~ All in `friday/tasking/`.
 - ~~Keep normal chat on the fast path.~~ `classify_request()` routes fast vs task in `llm_node`.
 - ~~Enable Gemini thinking only for complex tasks.~~ `build_llm(mode="planner")` sets `thinking_budget=1024`.
 - ~~Visible sub-routine terminal.~~ `standalone_executor.py` opens a colored CMD window for each task.
-- **Gap — completion callback not wired:** `start_task()` uses `os.system()` to launch the CMD window, so the in-process `_on_task_finished` callback never fires. FRIDAY does not yet speak a summary when a task completes. Fix: add a file-watcher loop in `service.py` that polls task JSON files and calls the callback when status transitions to `completed`.
+- ~~Completion callback.~~ File-watcher in `service.py` polls task JSONs every 3s and fires `_on_task_finished` when the standalone executor writes `completed` to the task file. FRIDAY speaks the summary.
 
 3. ~~Ship Phase 1 app launcher.~~ **Done (2026-04-15 / enhanced 2026-04-17).**
 - ~~App whitelist + aliases in `friday/config.py`.~~ 10 pinned apps, aliases for spoken variants.
@@ -49,10 +49,12 @@ This is the single top-level to-do list for the project. The sections below expa
 - Add room and device lookup, announcements, and basic media or volume control.
 - Keep Google Home and Nest as controllable endpoints, not microphones.
 
-6. ~~Ship Phase 4 Spotify.~~ **Partially done (2026-04-17). Basic playback only.**
+6. ~~Ship Phase 4 Spotify.~~ **Mostly done (2026-04-19).**
 - ~~Play/pause, next, previous via media keys.~~ `play_pause_media`, `next_track`, `previous_track` in `friday/tools/media.py`.
 - ~~Search and auto-play a track.~~ `search_spotify` finds a Spotify URI via DDGS and opens it via `spotify:track:` protocol — no API key needed.
-- **Still missing:** volume control, current-track query, queue management, playlist support.
+- ~~Playlist and album support.~~ `search_spotify` accepts `type` param (`track`, `playlist`, `album`). Delayed media-play key for auto-start.
+- ~~Volume control.~~ `set_volume` supports master volume and per-app volume (Spotify, Chrome, etc.) via pycaw.
+- **Still missing:** current-track query, queue management.
 
 7. ~~Ship Phase 5 Calendar and Gmail.~~ **Partially done (2026-04-17). Needs OAuth setup.**
 - ~~Read-focused tools first.~~ `list_upcoming_events` and `list_recent_emails` in `friday/tools/google_suite.py`. Read-only OAuth scopes only.
@@ -90,10 +92,10 @@ This is the single top-level to-do list for the project. The sections below expa
 - Reuse the same tool and task surface.
 - Keep permissions and confirmation behavior consistent.
 
-14. Ship Phase 11 memory.
-- Add lightweight memory only after responsiveness is stable.
-- Store compact facts and preferences, not giant transcripts.
-- Keep memory out of the hot path unless it clearly improves the turn.
+14. ~~Ship Phase 11 memory.~~ **Basic version done (2026-04-19).**
+- ~~Persistent JSON memory (`runtime/memory.json`).~~ `remember`, `forget`, `list_memories` tools in `friday/tools/memory.py`.
+- ~~Memories injected into system prompt at agent init.~~
+- **Still possible:** semantic search over memories, memory decay/relevance scoring.
 
 15. Improve hardware only after the software path feels solid.
 - Use better mics for real-world reliability.
@@ -634,9 +636,10 @@ and FRIDAY stays conversationally responsive instead of hanging on one long repl
 
 ### Known gaps to close next
 
-- **Task completion callback** — `_on_task_finished` in `agent_friday.py` never fires because `start_task()` uses `os.system()` instead of the in-process queue. Add a file-watcher to detect when the standalone executor writes `"completed"` to the task JSON and call the callback.
+- ~~Task completion callback~~ — Done (2026-04-19). File-watcher polls task JSONs and fires `_on_task_finished`.
 - **Phase 3 home bridge** — no Home Assistant integration yet.
-- **Phase 6b headless ask_claude** — every task is a visible CMD window right now; the quiet background path is not implemented.
+- **Phase 6b headless ask_claude** — every task is a visible CMD window right now; the quiet background path is not implemented. Now unblocked by the completion callback fix.
+- **Phase 7 file write/move/delete** — confirmation flow needed first.
 - External bridges (phone, Telegram, LAN) can attach to the same tool surface via `server.py --sse` or `--streamable-http` once the local surface is stable.
 
 ---
@@ -651,16 +654,15 @@ This order is optimized for responsiveness, not maximum feature count.
 
 All done. 14 MCP tools, no `@agents.function_tool` on the agent. First-activation latency also improved.
 
-### ~~Phase 0.5~~ — Core shipped (2026-04-17); completion callback gap remains
+### ~~Phase 0.5~~ — Done (2026-04-19)
 
 ~~Add a minimal task layer before expanding slow integrations.~~
 
-What's working:
+All working:
 - `friday/tasking/` package: models, store, router, planner, service, executor, standalone_executor.
 - `classify_request()` routes in `llm_node`. Task requests get an immediate ack + visible CMD sub-routine.
 - `build_llm(mode="planner")` enables thinking for the sub-routine.
-
-Gap: the `_on_task_finished` callback in `agent_friday.py` never fires because `start_task()` bypasses the in-process queue. FRIDAY doesn't speak a completion summary. To fix: convert the `_worker_loop` in `service.py` into a file-watcher that polls `runtime/tasks/active/` and triggers the callback when a task JSON transitions to `completed`.
+- File-watcher in `service.py` polls task JSONs every 3s and fires `_on_task_finished` callback so FRIDAY speaks the completion summary.
 
 ### ~~Phase 1~~ — Done (2026-04-15, enhanced 2026-04-17)
 

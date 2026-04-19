@@ -6,6 +6,7 @@ since the SDK tears down internal WebSocket connections on session.aclose().
 """
 
 import os
+from pathlib import Path
 from .config import (
     STT_PROVIDER, LLM_PROVIDER, TTS_PROVIDER,
     GEMINI_LLM_MODEL, OPENAI_LLM_MODEL, GROQ_LLM_MODEL, OLLAMA_LLM_MODEL,
@@ -99,10 +100,22 @@ def build_tts(http_session=None):
             http_session=http_session,
         )
     elif TTS_PROVIDER == "google":
-        logger.info("TTS → Google Gemini TTS")
+        logger.info("TTS → Google Gemini TTS (Charon)")
+        sa_file = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+        kwargs = {}
+        if sa_file:
+            import json
+            sa_path = Path(__file__).parents[1] / sa_file
+            if sa_path.exists():
+                with open(sa_path) as f:
+                    kwargs["credentials_info"] = json.load(f)
         return lk_google.TTS(
             model_name="gemini-2.5-flash-tts",
-            credentials_info={"api_key": os.getenv("GOOGLE_API_KEY")},
+            voice_name="Charon",
+            prompt="Speak quickly and naturally, flowing words together smoothly. Do not emphasize individual syllables or words. Light, quick delivery.",
+            speaking_rate=1.3,
+            volume_gain_db=-4.0,
+            **kwargs,
         )
     else:
         raise ValueError(f"Unknown TTS_PROVIDER: {TTS_PROVIDER!r}")

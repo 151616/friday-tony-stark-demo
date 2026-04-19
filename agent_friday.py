@@ -122,8 +122,11 @@ class FridayAgent(Agent):
     concerns: speaker gating, history trimming, streaming signals, greeting."""
 
     def __init__(self, stt, llm, tts, vad=None) -> None:
+        from friday.tools.memory import get_memories_prompt
+        memories = get_memories_prompt()
+        full_prompt = SYSTEM_PROMPT + ("\n\n" + memories if memories else "")
         super().__init__(
-            instructions=SYSTEM_PROMPT,
+            instructions=full_prompt,
             stt=stt, llm=llm, tts=tts,
             vad=vad or silero.VAD.load(
                 # Bumped from 0.92 / 0.5 to filter out background chatter,
@@ -261,9 +264,9 @@ async def _wait_for_stdin_command() -> str:
 
 
 _GREETING_INSTRUCTIONS = (
-    "Say a quick, casual greeting — one short sentence, "
-    "like 'Hey, what's up?' or 'Hi sir, what do you need?'. "
-    "Keep it natural. Do NOT call any tools. "
+    "Greet with one short, professional sentence. "
+    "Examples: 'At your service, sir.', 'Online and ready, sir.', 'What can I help you with, sir.', 'Hello, sir.'. "
+    "Never use his name. Do NOT call any tools. "
     "Do NOT mention the day or time unless it's relevant."
 )
 
@@ -375,28 +378,26 @@ async def entrypoint(ctx: JobContext) -> None:
     dismissed = asyncio.Event()
     dismissed.set()
 
+    _signing_off = False   # guard against interim+final double-fire
+
     @session.on("user_input_transcribed")
     def _on_user_transcript(ev):
+        nonlocal _signing_off
         text = (ev.transcript or "").lower().strip()
-        if dismissed.is_set():
+        if dismissed.is_set() or _signing_off:
             return
         if any(phrase in text for phrase in DISMISSAL_PHRASES):
+            _signing_off = True
             logger.info("Dismissal detected: %r", text)
 
             async def _sign_off():
-                try:
-                    session.interrupt()
-                except Exception:
-                    pass
-                await asyncio.sleep(0.15)
-                handle = await session.generate_reply(
-                    instructions=f"Say exactly: '{random.choice(SLEEP_RESPONSES)}' and nothing else.",
-                )
-                try:
-                    await handle.wait_for_playout()
-                except Exception:
-                    await asyncio.sleep(2.5)
+                nonlocal _signing_off
+                # The LLM already knows to say a casual sign-off for dismissal
+                # phrases (via the system prompt). Don't generate a second one —
+                # just wait for the natural response to play out, then end session.
+                await asyncio.sleep(6.0)
                 logger.info("Sign-off complete")
+                _signing_off = False
                 dismissed.set()
 
             asyncio.create_task(_sign_off())
@@ -424,6 +425,7 @@ async def entrypoint(ctx: JobContext) -> None:
             break
 
         # Re-activate: clear dismissal, generate a fresh greeting
+        _signing_off = False
         dismissed.clear()
         print("SESSION_STARTED", flush=True)
 
@@ -433,9 +435,9 @@ async def entrypoint(ctx: JobContext) -> None:
             await session.generate_reply(
                 instructions=(
                     f"It is currently {now}. "
-                    "Say a quick, casual greeting — one short sentence, "
-                    "like 'Hey, what's up?' or 'Hey Shiv, what do you need?'. "
-                    "Keep it natural. Do NOT call any tools. "
+                    "Greet with one short, professional sentence. "
+                    "Examples: 'At your service, sir.', 'Online and ready, sir.', 'What can I help you with, sir.', 'Hello, sir.'. "
+                    "Never use his name. Do NOT call any tools. "
                     "Do NOT mention the day or time unless it's relevant."
                 ),
                 tool_choice="none",
@@ -443,6 +445,22 @@ async def entrypoint(ctx: JobContext) -> None:
             logger.info("Re-activation greeting completed")
         except Exception as e:
             logger.warning("Re-activation greeting failed: %s", e)
+
+        # Enable mic AFTER greeting to avoid the race condition
+        try:
+            session.input.set_audio_enabled(True)
+            logger.info("Audio input enabled — listening for user speech")
+        except Exception as e:
+            logger.warning("Failed to enable audio input: %s", e)
+
+        # Stay active until user dismisses ("that'll be all", etc.)
+        await dismissed.wait()
+        logger.info("Session dismissed — gating mic")
+        try:
+            session.input.set_audio_enabled(False)
+        except Exception:
+            pass
+        print("SESSION_DONE", flush=True)
 
     # Clean up
     try:
