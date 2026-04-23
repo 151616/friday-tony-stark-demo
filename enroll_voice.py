@@ -26,8 +26,8 @@ CHUNK = 1600  # 100ms
 RECORD_SECONDS = 20
 OUTPUT_PATH = Path(__file__).parent / "voice_embedding.npy"
 PROMPTS = [
-    "Hey Jarvis, run a diagnostic and tell me how the systems are looking.",
-    "Friday, give me a brief on the world right now, boss.",
+    "Hey Friday, run a diagnostic and tell me how the systems are looking.",
+    "Friday, give me a brief on the world right now, sir.",
     "Open the world monitor and show me what I'm looking at.",
     "Stand down for now, I'll call you back in a minute.",
     "Talk naturally about what you did today for the rest of the time.",

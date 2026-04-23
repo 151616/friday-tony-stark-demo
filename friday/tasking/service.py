@@ -7,15 +7,15 @@ from uuid import uuid4
 from .models import TaskRecord
 from .store import create_task, load_task
 from .executor import set_completion_callback
+from friday.config import TASK_STATE_DIR
 
 logger = logging.getLogger("friday-agent")
 
 _GLOBAL_TOOLSET = None
 _WATCHER_TASK = None
 
-# Track tasks we've launched so the file-watcher knows which to monitor,
-# and which have already had their callback fired.
-_TRACKED_TASKS: dict[str, str] = {}   # task_id → last-seen status
+# Tasks whose callback has already fired — prevents re-notification.
+_NOTIFIED_TASKS: set[str] = set()
 
 _POLL_INTERVAL = 3.0  # seconds between file-system polls
 
@@ -26,11 +26,11 @@ def register_toolset(toolset):
 
 
 async def _file_watcher_loop():
-    """Poll task JSON files for status transitions to completed/failed.
+    """Poll ALL task JSON files in the task directory for completion.
 
-    The standalone executor (running in a separate CMD window) writes the
-    final status back to the JSON file.  This loop detects that change and
-    fires the completion callback so FRIDAY can speak the summary.
+    This scans the filesystem directly rather than relying on an in-memory
+    registry, so it catches tasks created by any process — the agent,
+    the MCP server (ask_claude), or the standalone executor.
     """
     import inspect
     from . import executor   # module ref so we always read the live _CALLBACK
@@ -38,8 +38,9 @@ async def _file_watcher_loop():
     while True:
         await asyncio.sleep(_POLL_INTERVAL)
         try:
-            for task_id, prev_status in list(_TRACKED_TASKS.items()):
-                if prev_status in ("completed", "failed"):
+            for json_file in TASK_STATE_DIR.glob("*.json"):
+                task_id = json_file.stem
+                if task_id in _NOTIFIED_TASKS:
                     continue  # already handled
 
                 task = load_task(task_id)
@@ -47,7 +48,7 @@ async def _file_watcher_loop():
                     continue
 
                 if task.status in ("completed", "failed"):
-                    _TRACKED_TASKS[task_id] = task.status
+                    _NOTIFIED_TASKS.add(task_id)
                     logger.info("File-watcher: task %s → %s", task_id, task.status)
 
                     cb = executor._CALLBACK
@@ -60,8 +61,6 @@ async def _file_watcher_loop():
                         except Exception as e:
                             logger.error("Task completion callback error for %s: %s",
                                          task_id, e)
-                elif task.status != prev_status:
-                    _TRACKED_TASKS[task_id] = task.status
         except Exception as e:
             logger.error("File-watcher loop error: %s", e)
 
@@ -70,6 +69,11 @@ def start_worker():
     """Start the background file-watcher loop."""
     global _WATCHER_TASK
     if _WATCHER_TASK is None:
+        # Seed with already-finished tasks so we don't re-notify on boot.
+        for json_file in TASK_STATE_DIR.glob("*.json"):
+            task = load_task(json_file.stem)
+            if task and task.status in ("completed", "failed"):
+                _NOTIFIED_TASKS.add(task.task_id)
         _WATCHER_TASK = asyncio.create_task(_file_watcher_loop())
 
 def start_task(goal: str, source: str = "voice") -> str:
@@ -88,9 +92,6 @@ def start_task(goal: str, source: str = "voice") -> str:
         steps=[]
     )
     create_task(task)
-
-    # Register with the file-watcher so we get a callback when done.
-    _TRACKED_TASKS[task_id] = "pending"
 
     # Launch a detached visible terminal window running the standalone executor.
     import os

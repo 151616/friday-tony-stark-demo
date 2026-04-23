@@ -112,9 +112,9 @@ def build_tts(http_session=None):
         return lk_google.TTS(
             model_name="gemini-2.5-flash-tts",
             voice_name="Charon",
-            prompt="Speak quickly and naturally, flowing words together smoothly. Do not emphasize individual syllables or words. Light, quick delivery.",
-            speaking_rate=1.3,
-            volume_gain_db=-4.0,
+            prompt="Speak at a slightly brisk pace. Flow words together smoothly without over-emphasizing individual syllables. Do not speak slowly.",
+            speaking_rate=1.0,  # ignored by Gemini TTS — pace is controlled by prompt
+            volume_gain_db=-6.0,
             **kwargs,
         )
     else:

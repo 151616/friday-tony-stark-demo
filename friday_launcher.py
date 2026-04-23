@@ -149,12 +149,19 @@ logger.info("FRIDAY launcher starting — log file: %s", LOG_FILE)
 # Config
 # ---------------------------------------------------------------------------
 
-WAKE_MODEL = "hey_jarvis_v0.1"
+WAKE_MODEL = "hey_jarvis_v0.1"  # TODO: train custom "hey friday" model via OpenWakeWord Colab notebook
 WAKE_THRESHOLD = 0.7          # was 0.7 — fewer false wakes from background noise
 SILENCE_TIMEOUT = 30.0
 AUDIO_RATE = 16000
 AUDIO_CHUNK = 1280  # 80ms at 16kHz
 CHIME_PATH = Path(__file__).parent / "sounds" / "activate.wav"
+BOOT_ACK_PATH = Path(__file__).parent / "sounds" / "booting_ack.wav"
+BOOT_ACK_TEXT = "Hello sir, give me a second to get everything booted up."
+BOOT_ACK_VOICE = os.getenv("LOCAL_TTS_VOICE", "").strip()
+try:
+    BOOT_ACK_RATE = int(os.getenv("LOCAL_TTS_RATE", "1"))
+except ValueError:
+    BOOT_ACK_RATE = 1
 
 # Mic selection — name substring (case-insensitive) of the device to use.
 # Empty / unset = system default. Run `python list_audio_devices.py` to see
@@ -356,6 +363,69 @@ def play_chime():
     threading.Thread(target=_play, daemon=True).start()
 
 
+def _ps_quote(text: str) -> str:
+    return "'" + text.replace("'", "''") + "'"
+
+
+def _ensure_boot_ack_clip() -> bool:
+    """Create a cached local TTS clip for the wake acknowledgement if needed."""
+    if BOOT_ACK_PATH.exists() and BOOT_ACK_PATH.stat().st_size > 0:
+        return True
+
+    BOOT_ACK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    script_lines = [
+        "Add-Type -AssemblyName System.Speech",
+        "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer",
+        "try {",
+        f"  $s.Rate = {BOOT_ACK_RATE}",
+    ]
+    if BOOT_ACK_VOICE:
+        script_lines.append(f"  $s.SelectVoice({_ps_quote(BOOT_ACK_VOICE)})")
+    script_lines.extend(
+        [
+            f"  $s.SetOutputToWaveFile({_ps_quote(str(BOOT_ACK_PATH))})",
+            f"  $s.Speak({_ps_quote(BOOT_ACK_TEXT)})",
+            "} finally {",
+            "  $s.Dispose()",
+            "}",
+        ]
+    )
+
+    try:
+        subprocess.run(
+            ["powershell.exe", "-NoProfile", "-Command", "\n".join(script_lines)],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except Exception as e:
+        logger.warning("Could not build local wake acknowledgement clip: %s", e)
+        return False
+
+    if not BOOT_ACK_PATH.exists() or BOOT_ACK_PATH.stat().st_size <= 0:
+        logger.warning("Local wake acknowledgement clip was not created")
+        return False
+
+    logger.info("Local wake acknowledgement clip ready (%s)", BOOT_ACK_PATH.name)
+    return True
+
+
+def play_activation_ack():
+    """Play the immediate local wake acknowledgement, falling back to the chime."""
+
+    def _play():
+        if _ensure_boot_ack_clip():
+            try:
+                winsound.PlaySound(str(BOOT_ACK_PATH), winsound.SND_FILENAME)
+                return
+            except Exception as e:
+                logger.warning("Could not play wake acknowledgement clip: %s", e)
+        play_chime()
+
+    threading.Thread(target=_play, daemon=True).start()
+
+
 # ---------------------------------------------------------------------------
 # Main launcher loop
 # ---------------------------------------------------------------------------
@@ -365,17 +435,19 @@ class AgentProcess:
 
     Protocol (line-based, over stdin/stdout):
         launcher → subprocess stdin:   START | QUIT
-        subprocess stdout → launcher:  FRIDAY_READY | SESSION_STARTED | SESSION_DONE
+        subprocess stdout → launcher:  FRIDAY_READY | SESSION_STARTED |
+                                       SESSION_LISTENING | SESSION_DONE |
                                        PROCESSING | SPEAKING
     """
 
-    def __init__(self, on_processing=None, on_speaking=None):
+    def __init__(self, on_processing=None, on_speaking=None, on_listening=None):
         self._proc: subprocess.Popen | None = None
         self._ready = threading.Event()
         self._session_done = threading.Event()
         self._reader_thread: threading.Thread | None = None
         self._on_processing = on_processing  # callback when LLM starts thinking
         self._on_speaking = on_speaking       # callback when first TTS content arrives
+        self._on_listening = on_listening     # callback when mic is live again
 
     @property
     def alive(self) -> bool:
@@ -450,6 +522,10 @@ class AgentProcess:
                     self._ready.set()
                 elif "SESSION_STARTED" in stripped:
                     logger.info("Agent subprocess signalled SESSION_STARTED")
+                elif "SESSION_LISTENING" in stripped:
+                    logger.info("Agent subprocess signalled SESSION_LISTENING")
+                    if self._on_listening:
+                        self._on_listening()
                 elif "SESSION_DONE" in stripped:
                     logger.info("Agent subprocess signalled SESSION_DONE")
                     self._session_done.set()
@@ -525,6 +601,7 @@ async def launcher_loop():
     agent = AgentProcess(
         on_processing=lambda: overlay.show_loading("Thinking..."),
         on_speaking=lambda: overlay.hide_loading(),
+        on_listening=lambda: overlay.show(),
     )
 
     overlay.start()
@@ -608,6 +685,7 @@ async def launcher_loop():
 
     # ---- One-time cold boot: spawn the agent and load models ----
     overlay.show_loading("Booting up Omnicron...")
+    _ensure_boot_ack_clip()
     agent.start()
     ready = await agent.wait_ready(timeout=60.0)
     if not ready or not agent.alive:
@@ -619,7 +697,7 @@ async def launcher_loop():
 
     wakeword.start_stream()
     state = State.SLEEPING
-    logger.info("FRIDAY launcher ready — say 'Hey Jarvis' to activate")
+    logger.info("FRIDAY launcher ready — say 'Hey Friday' to activate")
 
     try:
         while True:
@@ -639,7 +717,7 @@ async def launcher_loop():
                 if ptt_event.is_set():
                     ptt_event.clear()
                     logger.info("Manual activation via PTT — bypassing wake/speaker checks")
-                    play_chime()
+                    play_activation_ack()
                     overlay.show_loading("Waking up...")
                     state = State.ACTIVE
                     logger.info("State → ACTIVE")
@@ -649,9 +727,9 @@ async def launcher_loop():
                     None, wakeword.listen_once
                 )
                 if detected:
-                    # Instant feedback — chime + loading overlay the moment
-                    # the wake word is recognised, BEFORE speaker verification.
-                    play_chime()
+                    # Instant visual feedback the moment the wake word is
+                    # recognised; the spoken acknowledgement follows successful
+                    # speaker verification.
                     overlay.show_loading("Waking up...")
 
                     if verifier.enabled:
@@ -667,6 +745,7 @@ async def launcher_loop():
                             overlay.hide()
                             continue
                         logger.info("Speaker verified (sim=%.3f)", sim)
+                    play_activation_ack()
                     state = State.ACTIVE
                     logger.info("State → ACTIVE")
 

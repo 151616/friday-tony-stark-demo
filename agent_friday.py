@@ -238,7 +238,7 @@ class FridayAgent(Agent):
         # Intentionally silent. Greetings are fired from the activation loop
         # in entrypoint() on each START — this lets us pre-start the session
         # during boot (paying VAD load + connection setup up-front) without
-        # the agent speaking into an empty room. Result: first "hey jarvis"
+        # the agent speaking into an empty room. Result: first "hey friday"
         # feels as snappy as re-activation.
         logger.info("on_enter — session attached (greeting deferred to activation)")
 
@@ -263,21 +263,19 @@ async def _wait_for_stdin_command() -> str:
             return cmd
 
 
-_GREETING_INSTRUCTIONS = (
-    "Greet with one short, professional sentence. "
-    "Examples: 'At your service, sir.', 'Online and ready, sir.', 'What can I help you with, sir.', 'Hello, sir.'. "
-    "Never use his name. Do NOT call any tools. "
-    "Do NOT mention the day or time unless it's relevant."
+_READY_LINE_INSTRUCTIONS = (
+    "You have just finished waking up and are now ready to help. "
+    "Reply with one short, professional sentence that invites the user's request. "
+    "Examples: 'Done, sir. What can I help you with?', 'All set, sir. What can I do for you?', 'Ready when you are, sir.' "
+    "Never use his name. Do NOT mention time, boot steps, setup, or tools. Do NOT call any tools."
 )
 
 
 async def _fire_greeting(session) -> None:
     """Generate the activation greeting on the already-running session."""
-    from datetime import datetime
-    now = datetime.now().strftime("%A, %I:%M %p")
     try:
         await session.generate_reply(
-            instructions=f"It is currently {now}. {_GREETING_INSTRUCTIONS}",
+            instructions=_READY_LINE_INSTRUCTIONS,
             tool_choice="none",
         )
         logger.info("Greeting completed")
@@ -285,12 +283,37 @@ async def _fire_greeting(session) -> None:
         logger.warning("Greeting failed: %s", e)
 
 
+def _refresh_stt_streams(stt_inst) -> None:
+    """Force Sarvam's live STT streams to reconnect before each activation."""
+    if STT_PROVIDER != "sarvam":
+        return
+
+    streams = list(getattr(stt_inst, "_streams", ()))
+    if not streams:
+        logger.info("No active Sarvam STT streams found to refresh")
+        return
+
+    refreshed = 0
+    for stream in streams:
+        update_options = getattr(stream, "update_options", None)
+        if not callable(update_options):
+            continue
+        try:
+            update_options(language="en-IN", model="saaras:v3", mode="transcribe")
+            refreshed += 1
+        except Exception as e:
+            logger.warning("Could not refresh Sarvam STT stream: %s", e)
+
+    if refreshed:
+        logger.info("Refreshed %d Sarvam STT stream(s) for activation", refreshed)
+
+
 async def entrypoint(ctx: JobContext) -> None:
     """Boot once, pre-start the session, then loop activations.
 
     Key timing choice: the LiveKit session is started BEFORE we announce
     FRIDAY_READY to the launcher. That front-loads the VAD load +
-    room connection cost (~2s) into boot, so the first "hey jarvis"
+    room connection cost (~2s) into boot, so the first "hey friday"
     after launch is as fast as a re-activation. We keep the mic
     disabled on the session until the user actually wakes the agent,
     so no transcripts reach the LLM during the idle wait.
@@ -362,11 +385,51 @@ async def entrypoint(ctx: JobContext) -> None:
     
     async def _on_task_finished(task):
         try:
-            logger.info(f"Task {task.task_id} completed. Narrating summary.")
-            await session.generate_reply(
-                instructions=f"The background task finished. Speak the following summary exactly in a natural tone, do not list steps or add extra flair: '{task.final_summary}'",
-                tool_choice="none",
-            )
+            logger.info(f"Task {task.task_id} finished ({task.status}).")
+            summary = task.final_summary or ""
+
+            if summary.startswith("TOKEN_LIMIT:"):
+                # Claude ran out of tokens — offer alternatives
+                await session.generate_reply(
+                    instructions=(
+                        "Claude ran out of tokens or hit a rate limit while working "
+                        "on a task. Inform the user briefly and ask if they'd like "
+                        "you to try it yourself instead, or try again later. "
+                        "Keep it to one or two sentences. "
+                        "Example: 'Claude hit its token limit on that one, sir. "
+                        "Want me to try it myself?'"
+                    ),
+                    tool_choice="none",
+                )
+            elif summary.startswith("TIMEOUT:"):
+                await session.generate_reply(
+                    instructions=(
+                        "Claude took too long on a background task and was stopped. "
+                        "Inform the user briefly and ask if they'd like you to try "
+                        "it yourself. One sentence."
+                    ),
+                    tool_choice="none",
+                )
+            elif task.status == "failed":
+                await session.generate_reply(
+                    instructions=(
+                        f"A background task failed. Error: '{summary}'\n\n"
+                        f"Inform the user briefly in one sentence that it didn't work. "
+                        f"Don't read technical errors. Ask if they want to try another way."
+                    ),
+                    tool_choice="none",
+                )
+            else:
+                await session.generate_reply(
+                    instructions=(
+                        f"A background task just completed. "
+                        f"Here is the raw result: '{summary}'\n\n"
+                        f"Summarize this in ONE short sentence to the user. "
+                        f"Do not read filenames, paths, technical details, or feature lists. "
+                        f"Just confirm what was done. Example: 'The dice roller is done, sir.'"
+                    ),
+                    tool_choice="none",
+                )
         except Exception as e:
             logger.error(f"Task completion callback failed: {e}")
             
@@ -403,7 +466,7 @@ async def entrypoint(ctx: JobContext) -> None:
             asyncio.create_task(_sign_off())
 
     # Pre-start the session so VAD + room connection is warm before the
-    # first "hey jarvis". Silence the mic immediately — we don't want
+    # first "hey friday". Silence the mic immediately — we don't want
     # transcripts landing in the LLM before the user actually wakes it.
     await session.start(
         agent=FridayAgent(stt=stt_inst, llm=llm_inst, tts=tts_inst),
@@ -424,32 +487,30 @@ async def entrypoint(ctx: JobContext) -> None:
             logger.info("Received %r — shutting down", cmd or "EOF")
             break
 
-        # Re-activate: clear dismissal, generate a fresh greeting
+        # Re-activate: clear dismissal, refresh STT, then generate the ready line
         _signing_off = False
         dismissed.clear()
         print("SESSION_STARTED", flush=True)
 
         try:
-            from datetime import datetime
-            now = datetime.now().strftime("%A, %I:%M %p")
+            _refresh_stt_streams(stt_inst)
+        except Exception as e:
+            logger.warning("STT refresh failed before activation: %s", e)
+
+        try:
             await session.generate_reply(
-                instructions=(
-                    f"It is currently {now}. "
-                    "Greet with one short, professional sentence. "
-                    "Examples: 'At your service, sir.', 'Online and ready, sir.', 'What can I help you with, sir.', 'Hello, sir.'. "
-                    "Never use his name. Do NOT call any tools. "
-                    "Do NOT mention the day or time unless it's relevant."
-                ),
+                instructions=_READY_LINE_INSTRUCTIONS,
                 tool_choice="none",
             )
-            logger.info("Re-activation greeting completed")
+            logger.info("Re-activation ready line completed")
         except Exception as e:
-            logger.warning("Re-activation greeting failed: %s", e)
+            logger.warning("Re-activation ready line failed: %s", e)
 
-        # Enable mic AFTER greeting to avoid the race condition
+        # Enable mic after the ready line so the agent doesn't hear itself.
         try:
             session.input.set_audio_enabled(True)
             logger.info("Audio input enabled — listening for user speech")
+            print("SESSION_LISTENING", flush=True)
         except Exception as e:
             logger.warning("Failed to enable audio input: %s", e)
 

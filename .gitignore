@@ -11,6 +11,7 @@ token.json
 friday-493612-*.json
 logs/
 runtime/
+sounds/booting_ack.wav
 
 # Created by https://www.toptal.com/developers/gitignore/api/python
 # Edit at https://www.toptal.com/developers/gitignore?templates=python
