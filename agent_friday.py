@@ -51,7 +51,6 @@ from livekit.agents import (
     JobContext, WorkerOptions, cli,
     llm as lk_llm, stt, TurnHandlingOptions,
 )
-from livekit.agents.llm.mcp import MCPServerStdio, MCPToolset
 from livekit.agents.voice import Agent, AgentSession
 from livekit.agents.voice.turn import InterruptionOptions, EndpointingOptions
 from livekit.plugins import silero
@@ -62,6 +61,7 @@ from friday.config import (
     MAX_HISTORY_ITEMS, logger,
 )
 from friday.providers import build_stt, build_llm, build_tts
+from friday.routing import LocalDomainToolPool, classify_domains
 from friday.speaker_gate import get_speaker_gate
 
 # Repo root — used to locate server.py when spawning the MCP subprocess.
@@ -121,10 +121,11 @@ class FridayAgent(Agent):
     (see server.py + friday/tools/). This class keeps voice-specific
     concerns: speaker gating, history trimming, streaming signals, greeting."""
 
-    def __init__(self, stt, llm, tts, vad=None) -> None:
+    def __init__(self, stt, llm, tts, *, tool_pool: LocalDomainToolPool, vad=None) -> None:
         from friday.tools.memory import get_memories_prompt
         memories = get_memories_prompt()
         full_prompt = SYSTEM_PROMPT + ("\n\n" + memories if memories else "")
+        self._tool_pool = tool_pool
         super().__init__(
             instructions=full_prompt,
             stt=stt, llm=llm, tts=tts,
@@ -136,6 +137,13 @@ class FridayAgent(Agent):
                 min_silence_duration=0.8,
             ),
         )
+
+    @staticmethod
+    def _latest_user_text(chat_ctx) -> str:
+        for item in reversed(chat_ctx.items):
+            if getattr(item, "type", None) == "message" and getattr(item, "role", None) == "user":
+                return (getattr(item, "text_content", None) or "").strip()
+        return ""
 
     # -- Speaker-gated STT ------------------------------------------------
 
@@ -191,6 +199,15 @@ class FridayAgent(Agent):
         if MAX_HISTORY_ITEMS and len(chat_ctx.items) > MAX_HISTORY_ITEMS:
             chat_ctx = chat_ctx.truncate(max_items=MAX_HISTORY_ITEMS)
 
+        user_text = self._latest_user_text(chat_ctx)
+        active_domains = classify_domains(user_text)
+        active_tools = await self._tool_pool.get_toolsets(active_domains)
+        logger.info(
+            "Tool routing: domains=%s for user=%r",
+            ",".join(active_domains),
+            user_text[:120],
+        )
+
         # Signal the launcher that we're thinking
         print("PROCESSING", flush=True)
 
@@ -198,7 +215,7 @@ class FridayAgent(Agent):
         scrubber = _ToolLeakScrubber() if use_scrubber else None
         first_content = True
 
-        async for chunk in Agent.default.llm_node(self, chat_ctx, tools, model_settings):
+        async for chunk in Agent.default.llm_node(self, chat_ctx, active_tools, model_settings):
             # Signal when first real content arrives (TTS will start speaking)
             if (
                 first_content
@@ -340,21 +357,11 @@ async def entrypoint(ctx: JobContext) -> None:
     )
     logger.info("Providers + speaker gate warm — preparing session")
 
-    # Spawn the local MCP server as a stdio subprocess and wrap it in a
-    # toolset. This is the single source of truth for tools (see server.py
-    # + friday/tools/). Stdio keeps everything in-process-tree — no port,
-    # no URL, no network hop. The session closes the toolset on aclose(),
-    # which closes the underlying MCP subprocess.
-    mcp_toolset = MCPToolset(
-        id="friday-local",
-        mcp_server=MCPServerStdio(
-            command=sys.executable,
-            args=[str(_REPO_ROOT / "server.py")],
-            cwd=str(_REPO_ROOT),
-            client_session_timeout_seconds=15,
-        ),
-    )
-    logger.info("MCP stdio toolset prepared (%s)", _REPO_ROOT / "server.py")
+    # Keep a small always-on core tool surface warm, and route heavier domains
+    # in only when the current request needs them.
+    tool_pool = LocalDomainToolPool(repo_root=_REPO_ROOT)
+    core_toolset = tool_pool.get_toolset("core")
+    logger.info("Domain tool pool prepared (%s)", _REPO_ROOT / "server.py")
 
     session = AgentSession(
         turn_handling=TurnHandlingOptions(
@@ -372,7 +379,7 @@ async def entrypoint(ctx: JobContext) -> None:
                 false_interruption_timeout=3.0,
             ),
         ),
-        tools=[mcp_toolset],
+        tools=[core_toolset],
         max_tool_steps=3,
     )
 
@@ -380,7 +387,7 @@ async def entrypoint(ctx: JobContext) -> None:
     # Phase 0.5: Task Orchestration Setup
     # -----------------------------------------------------------------------
     from friday.tasking import register_toolset, start_worker, set_completion_callback
-    register_toolset(mcp_toolset)
+    register_toolset(core_toolset)
     start_worker()
     
     async def _on_task_finished(task):
@@ -469,7 +476,7 @@ async def entrypoint(ctx: JobContext) -> None:
     # first "hey friday". Silence the mic immediately — we don't want
     # transcripts landing in the LLM before the user actually wakes it.
     await session.start(
-        agent=FridayAgent(stt=stt_inst, llm=llm_inst, tts=tts_inst),
+        agent=FridayAgent(stt=stt_inst, llm=llm_inst, tts=tts_inst, tool_pool=tool_pool),
         room=ctx.room,
     )
     try:
@@ -526,6 +533,10 @@ async def entrypoint(ctx: JobContext) -> None:
     # Clean up
     try:
         await session.aclose()
+    except Exception:
+        pass
+    try:
+        await tool_pool.aclose()
     except Exception:
         pass
     ctx.shutdown("stdin closed")

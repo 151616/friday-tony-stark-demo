@@ -1,21 +1,54 @@
 """
-Tool registry — imports and registers all tool modules with the MCP server.
-Add new tool modules here as you build them.
+Tool registry — imports and registers tool modules with the MCP server.
+
+The registry supports domain-scoped registration so the live voice agent can
+keep a smaller tool surface per request while background executors can still
+load the full suite.
 """
 
-from friday.tools import web, system, utils, apps, media, messaging, audio, files, google_suite, memory, claude_delegate
+from collections.abc import Iterable
+
+from friday.tools import (
+    apps,
+    audio,
+    claude_delegate,
+    files,
+    google_suite,
+    media,
+    memory,
+    messaging,
+    system,
+    utils,
+    web,
+)
+
+DOMAIN_MODULES = {
+    # Core stays always-on for the live voice agent. It intentionally includes
+    # the web/search tools because current-events questions are high-risk if the
+    # model cannot reach search in the turn where it needs it.
+    "core": (web, system, utils, apps, messaging, memory, claude_delegate),
+    "media": (media, audio),
+    "files": (files,),
+    "google": (google_suite,),
+}
 
 
-def register_all_tools(mcp):
-    """Register all tool groups onto the MCP server instance."""
-    web.register(mcp)
-    system.register(mcp)
-    utils.register(mcp)
-    apps.register(mcp)
-    media.register(mcp)
-    messaging.register(mcp)
-    audio.register(mcp)
-    files.register(mcp)
-    google_suite.register(mcp)
-    memory.register(mcp)
-    claude_delegate.register(mcp)
+def available_domains() -> tuple[str, ...]:
+    return tuple(DOMAIN_MODULES.keys())
+
+
+def register_all_tools(mcp, domains: Iterable[str] | None = None):
+    """Register all requested tool groups onto the MCP server instance."""
+    if domains is None:
+        selected = tuple(DOMAIN_MODULES.keys())
+    else:
+        selected = tuple(dict.fromkeys(domains))
+
+    for domain in selected:
+        modules = DOMAIN_MODULES.get(domain)
+        if modules is None:
+            raise ValueError(
+                f"Unknown tool domain: {domain!r}. Valid domains: {', '.join(available_domains())}"
+            )
+        for module in modules:
+            module.register(mcp)

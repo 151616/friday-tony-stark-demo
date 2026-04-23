@@ -4,11 +4,12 @@ Default transport is stdio (used by agent_friday.py as an embedded subprocess).
 Pass --sse to expose the same tools over SSE for external clients.
 
 Run:
-  python server.py              # stdio (for agent)
-  python server.py --sse        # sse on default port
+  python server.py                      # stdio (all tools)
+  python server.py --domain core        # stdio (core tools only)
+  python server.py --sse                # sse on default port
 """
 
-import sys
+import argparse
 
 from mcp.server.fastmcp import FastMCP
 from friday.tools import register_all_tools
@@ -25,19 +26,28 @@ mcp = FastMCP(
     ),
 )
 
-# Register tools, prompts, and resources
-register_all_tools(mcp)
-register_all_prompts(mcp)
-register_all_resources(mcp)
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--sse", action="store_true")
+    parser.add_argument("--streamable-http", action="store_true")
+    parser.add_argument("--domain", action="append", default=[])
+    return parser.parse_args()
 
 
 def main():
+    args = _parse_args()
+
+    # Register tools, prompts, and resources.
+    register_all_tools(mcp, domains=args.domain or None)
+    register_all_prompts(mcp)
+    register_all_resources(mcp)
+
     # Default transport is stdio so agent_friday.py can spawn this module
     # as an MCPServerStdio subprocess without any port / URL config.
     transport = "stdio"
-    if "--sse" in sys.argv:
+    if args.sse:
         transport = "sse"
-    elif "--streamable-http" in sys.argv:
+    elif args.streamable_http:
         transport = "streamable-http"
     mcp.run(transport=transport)
 
