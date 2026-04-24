@@ -81,6 +81,22 @@ DOMAINS: dict[str, ToolDomain] = {
             "mail",
         ),
     ),
+    "frc": ToolDomain(
+        name="frc",
+        description="FIRST Robotics Competition tools for building, deploying, and simulating code",
+        keywords=(
+            "frc",
+            "robot",
+            "robot code",
+            "deploy",
+            "build code",
+            "simulation",
+            "driver station",
+            "dashboard",
+            "elastic",
+            "roborio",
+        ),
+    ),
 }
 
 
