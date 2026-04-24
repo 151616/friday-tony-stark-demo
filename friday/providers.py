@@ -26,7 +26,7 @@ from livekit.plugins import (
 )
 
 
-def build_stt(http_session=None):
+def build_stt(http_session=None, room_name=None):
     if STT_PROVIDER == "sarvam":
         logger.info("STT → Sarvam Saaras v3")
         return sarvam.STT(

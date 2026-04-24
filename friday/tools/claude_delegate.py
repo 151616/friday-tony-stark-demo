@@ -9,6 +9,7 @@ FRIDAY speaks a summary of what Claude did.
 
 import logging
 import os
+import sys
 import subprocess
 import threading
 from datetime import datetime
@@ -171,3 +172,42 @@ def register(mcp):
         thread.start()
 
         return f"Delegated to Claude (task {task_id}). I'll report back when it's done."
+
+    @mcp.tool()
+    def delegate_to_orchestrator(goal: str) -> str:
+        """
+        Spawn a highly capable background orchestrator that has full access to ALL your MCP tools.
+        Use this for highly complex, multi-step workflows like tuning PIDs iteratively, 
+        reading multiple files and pushing massive code refactors, or running test suites.
+        This physically opens a new visible command window on the user's screen so they can watch it work.
+        """
+        task_id = f"orchestrator_{datetime.now().strftime('%Y%m%d')}_{uuid4().hex[:6]}"
+
+        task = TaskRecord(
+            task_id=task_id,
+            goal=goal,
+            status="pending",
+            mode="planner",
+            source="voice",
+            created_at=datetime.now().isoformat(),
+            updated_at=datetime.now().isoformat(),
+            steps=[],
+        )
+        create_task(task)
+
+        # Launch the standalone_executor in a new visible cmd window
+        try:
+            # We use CREATE_NEW_CONSOLE so the user can physically watch the agent think
+            creation_flags = 0
+            if os.name == "nt":
+                creation_flags = subprocess.CREATE_NEW_CONSOLE
+
+            subprocess.Popen(
+                [sys.executable, "-m", "friday.tasking.standalone_executor", task_id],
+                cwd=str(_REPO_ROOT),
+                creationflags=creation_flags
+            )
+            return f"Successfully spawned the background orchestrator. You should see a new command window pop up to handle task '{goal[:50]}...'."
+        except Exception as e:
+            logger.error("Failed to spawn orchestrator: %s", e)
+            return f"Error spawning orchestrator: {e}"

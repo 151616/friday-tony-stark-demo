@@ -10,7 +10,7 @@ from uuid import uuid4
 import os
 from pathlib import Path
 from friday.tasking.models import TaskRecord
-from friday.tasking.store import create_task, update_task
+from friday.tasking.store import create_task, save_task
 
 logger = logging.getLogger("friday-agent")
 
@@ -30,7 +30,7 @@ def _tuner_logging_loop(task_id: str, ip: str, p_key: str, target_key: str, actu
         if task:
             task.status = "failed"
             task.final_summary = "Dependencies pyntcore and matplotlib are not installed."
-            update_task(task)
+            save_task(task)
         return
 
     # Initialize NetworkTables client
@@ -118,7 +118,7 @@ def _tuner_logging_loop(task_id: str, ip: str, p_key: str, target_key: str, actu
     if task:
         task.status = "completed"
         task.final_summary = summary
-        update_task(task)
+        save_task(task)
 
 
 def register(mcp):

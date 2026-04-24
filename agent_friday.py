@@ -517,12 +517,17 @@ async def entrypoint(ctx: JobContext) -> None:
             logger.warning("Re-activation ready line failed: %s", e)
 
         # Enable mic after the ready line so the agent doesn't hear itself.
-        try:
-            session.input.set_audio_enabled(True)
-            logger.info("Audio input enabled — listening for user speech")
+        # In console mode, don't enable audio since there's no audio input.
+        if ctx.room.name != "console":
+            try:
+                session.input.set_audio_enabled(True)
+                logger.info("Audio input enabled — listening for user speech")
+                print("SESSION_LISTENING", flush=True)
+            except Exception as e:
+                logger.warning("Failed to enable audio input: %s", e)
+        else:
+            logger.info("Console mode — skipping audio input enable")
             print("SESSION_LISTENING", flush=True)
-        except Exception as e:
-            logger.warning("Failed to enable audio input: %s", e)
 
         # Stay active until user dismisses ("that'll be all", etc.)
         await dismissed.wait()

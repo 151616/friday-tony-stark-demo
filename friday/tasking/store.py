@@ -12,6 +12,9 @@ logger = logging.getLogger("friday-agent")
 def create_task(task: TaskRecord) -> None:
     save_task(task)
 
+def update_task(task: TaskRecord) -> None:
+    save_task(task)
+
 def load_task(task_id: str) -> Optional[TaskRecord]:
     path = TASK_STATE_DIR / f"{task_id}.json"
     if not path.is_file():
