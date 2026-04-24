@@ -4,85 +4,105 @@ import asyncio
 import sys
 from pathlib import Path
 
+from livekit.agents.llm import Toolset
 from livekit.agents.llm.mcp import MCPServerStdio, MCPToolset
 
 from friday.routing.domains import DOMAINS
 
 
+# Maps each domain to the tool names it owns. Built once at import from the
+# same DOMAIN_MODULES registry that server.py uses, so they can never drift.
+def _build_domain_tool_map() -> dict[str, set[str]]:
+    from mcp.server.fastmcp import FastMCP
+    from friday.tools import DOMAIN_MODULES
+
+    mapping: dict[str, set[str]] = {}
+    for domain, modules in DOMAIN_MODULES.items():
+        mcp = FastMCP(name="probe")
+        for mod in modules:
+            mod.register(mcp)
+        mapping[domain] = {t.name for t in mcp._tool_manager.list_tools()}
+    return mapping
+
+
+DOMAIN_TOOL_NAMES: dict[str, set[str]] = _build_domain_tool_map()
+
+
+class _FilteredToolset(Toolset):
+    """A lightweight read-only view over a subset of an MCPToolset's tools.
+
+    This avoids mutating the shared MCPToolset — each LLM turn gets its own
+    filtered view containing only the tools for the active domains.
+    """
+
+    def __init__(self, *, source: MCPToolset, allowed_names: set[str]) -> None:
+        # Don't call super().__init__ with tools — we set _tools directly
+        super().__init__(id=f"{source.id}-filtered")
+        self._tools = [t for t in source.tools if t.name in allowed_names]
+
+    async def setup(self) -> _FilteredToolset:
+        # Tools are already initialised on the source toolset — nothing to do.
+        return self
+
+    async def aclose(self) -> None:
+        # Don't close — the source toolset owns the MCP connection.
+        pass
+
+
 class LocalDomainToolPool:
-    """Lazily manages local MCP toolsets per domain, with auto-shutdown for idle memory."""
+    """Single-process MCP tool pool with per-turn domain filtering.
+
+    Instead of spawning one MCP server subprocess per domain (expensive in RAM),
+    this spawns ONE server.py process with all tools loaded and filters the tool
+    list per LLM turn based on the domain classifier output.
+    """
 
     def __init__(self, *, repo_root: Path) -> None:
         self._repo_root = Path(repo_root)
-        self._toolsets: dict[str, MCPToolset] = {}
-        self._last_accessed: dict[str, float] = {}
-        self._bg_task = None
+        self._toolset: MCPToolset | None = None
+        self._setup_lock = asyncio.Lock()
 
-    def _start_reaper_if_needed(self):
-        if self._bg_task is None or self._bg_task.done():
-            self._bg_task = asyncio.create_task(self._reaper_loop())
-
-    async def _reaper_loop(self):
-        while True:
-            await asyncio.sleep(10)
-            now = asyncio.get_running_loop().time()
-            to_close = []
-            for domain, toolset in list(self._toolsets.items()):
-                # Keep 'core' alive permanently to reduce latency on basic commands
-                if domain == "core":
-                    continue
-                # If unused for 120 seconds (2 minutes), shut it down to free RAM
-                if now - self._last_accessed.get(domain, now) > 120.0:
-                    to_close.append(domain)
-            
-            for domain in to_close:
-                toolset = self._toolsets.pop(domain, None)
-                if toolset:
-                    self._last_accessed.pop(domain, None)
-                    print(f"[\033[93mMemory Manager\033[0m] Shutting down idle domain to free RAM: {domain}", flush=True)
-                    asyncio.create_task(toolset.aclose())
-
-    def _create_toolset(self, domain: str) -> MCPToolset:
-        if domain not in DOMAINS:
-            raise ValueError(f"Unknown routing domain: {domain!r}")
-
+    def _create_toolset(self) -> MCPToolset:
         return MCPToolset(
-            id=f"friday-{domain}",
+            id="friday-all",
             mcp_server=MCPServerStdio(
                 command=sys.executable,
-                args=[str(self._repo_root / "server.py"), "--domain", domain],
+                args=[str(self._repo_root / "server.py")],
                 cwd=str(self._repo_root),
-                client_session_timeout_seconds=15,
+                client_session_timeout_seconds=30,
             ),
         )
 
+    async def _ensure_ready(self) -> MCPToolset:
+        async with self._setup_lock:
+            if self._toolset is None:
+                self._toolset = self._create_toolset()
+                await asyncio.shield(self._toolset.setup())
+            return self._toolset
+
     def get_toolset(self, domain: str) -> MCPToolset:
-        self._start_reaper_if_needed()
-        self._last_accessed[domain] = asyncio.get_running_loop().time()
-        
-        toolset = self._toolsets.get(domain)
-        if toolset is None:
-            toolset = self._create_toolset(domain)
-            self._toolsets[domain] = toolset
-        return toolset
+        """Return the shared toolset (for pre-warming at boot).
+        Actual domain filtering happens in get_toolsets()."""
+        if domain not in DOMAINS:
+            raise ValueError(f"Unknown routing domain: {domain!r}")
+        if self._toolset is None:
+            self._toolset = self._create_toolset()
+        return self._toolset
 
-    async def get_toolsets(self, domains: list[str]) -> list[MCPToolset]:
-        now = asyncio.get_running_loop().time()
+    async def get_toolsets(self, domains: list[str]) -> list[_FilteredToolset]:
+        """Return a filtered toolset containing only tools for the given domains."""
+        source = await self._ensure_ready()
+
+        # Collect all tool names from the requested domains
+        allowed: set[str] = set()
         for d in domains:
-            self._last_accessed[d] = now
+            names = DOMAIN_TOOL_NAMES.get(d)
+            if names:
+                allowed |= names
 
-        ordered_domains = list(dict.fromkeys(domains))
-        toolsets = [self.get_toolset(domain) for domain in ordered_domains]
-        for toolset in toolsets:
-            # Shield to prevent agent cancellation (e.g. from user interruption) from cancelling
-            # the underlying MCP initialization, which would crash the MCP subprocess due to an SDK bug.
-            await asyncio.shield(toolset.setup())
-        return toolsets
+        return [_FilteredToolset(source=source, allowed_names=allowed)]
 
     async def aclose(self) -> None:
-        if self._bg_task and not self._bg_task.done():
-            self._bg_task.cancel()
-        for toolset in list(self._toolsets.values()):
-            await toolset.aclose()
-        self._toolsets.clear()
-        self._last_accessed.clear()
+        if self._toolset is not None:
+            await self._toolset.aclose()
+            self._toolset = None

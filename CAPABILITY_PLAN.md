@@ -72,10 +72,10 @@ This is the single top-level to-do list for the project. The sections below expa
 - `create_document` (in `web.py`) — opens Google Slides, Docs, Sheets, or a new GitHub repo via shortcut URLs.
 - `draft_message` (in `messaging.py`) — prefills a WhatsApp URI or copies text to clipboard and opens Discord. Early Phase 8 work, not yet read-capable.
 
-10. Ship Phase 7 file write, move, and delete.
-- Reuse the confirmation system.
-- Keep all operations inside approved roots.
-- Log every action and result.
+10. ~~Ship Phase 7 file write, move, and delete.~~ **Done (2026-04-19).**
+- ~~Reuse the confirmation system.~~ `delete_file` uses two-step confirm flow.
+- ~~Keep all operations inside approved roots.~~ All ops bounded by `FRIDAY_FILE_ROOTS`.
+- ~~Log every action and result.~~
 
 11. Ship Phase 8 WhatsApp Web (full).
 - `draft_message` is a start, but read capability is missing.
@@ -97,14 +97,105 @@ This is the single top-level to-do list for the project. The sections below expa
 - ~~Memories injected into system prompt at agent init.~~
 - **Still possible:** semantic search over memories, memory decay/relevance scoring.
 
-15. Improve hardware only after the software path feels solid.
+15. Ship Phase 12 weather.
+- Free API (open-meteo or WeatherAPI.com), no auth required.
+- Current conditions + forecast. "What's the weather?" / "Will it rain tomorrow?"
+- Use IP geolocation for default location, accept city names for anywhere else.
+- Fast path — should feel instant.
+
+16. Ship Phase 13 unit conversion, math, and translation.
+- "How many pounds is 80 kilos?" / "What's 20% of 350?"
+- "How do you say 'good morning' in Hindi?"
+- Can be handled by the LLM natively — no tool needed for most cases.
+- Add a `calculate` tool only if precision matters (eval-based, not LLM math).
+
+17. Ship Phase 14 clipboard integration.
+- "Copy that" / "Read what's in my clipboard" / "Paste this into..."
+- Windows `win32clipboard` API — trivial to implement.
+- Fast path, no confirmation needed for read. Write could auto-copy tool results.
+
+18. Ship Phase 15 system monitoring.
+- "How's my CPU?" / "Am I running low on storage?" / "What's eating my RAM?"
+- `psutil` for CPU, RAM, disk, battery, top processes.
+- Fast path — instant response.
+
+19. Ship Phase 16 timers and alarms.
+- "Set a timer for 10 minutes" / "Wake me up at 7am."
+- In-process async timers with chime/TTS callback on expiry.
+- Need a persistent store for alarms that survive restarts.
+- "Cancel my timer" / "How much time is left?"
+
+20. Ship Phase 17 reminders.
+- "Remind me to call John at 3pm" / "Remind me to buy milk when I get home."
+- Time-based reminders: scheduled task with TTS callback (similar to timers).
+- Location-based reminders: future — needs phone GPS bridge.
+- Could integrate with Google Tasks API for persistence + cross-device sync.
+
+21. Ship Phase 18 screenshot and screen reading.
+- "What's on my screen?" / "Read that error message."
+- `PIL.ImageGrab.grab()` → send to Gemini vision for analysis.
+- Very JARVIS — situational awareness of what the user is looking at.
+- Fast path for capture, slow path for vision analysis (~2-3s).
+
+22. Ship Phase 19 maps and navigation.
+- "How long to get to the airport?" / "Navigate to the nearest coffee shop."
+- Google Maps MCP or direct Directions API.
+- Return spoken ETA + traffic summary, optionally open Google Maps in browser.
+- Needs API key.
+
+23. Ship Phase 20 package tracking.
+- "Where's my Amazon order?" / "Track my package."
+- Parse tracking numbers from email (requires Gmail search), then query carrier APIs.
+- Or use a unified tracking API (17track, AfterShip).
+- Slow path — multi-step: find email → extract tracking → query status.
+
+24. Ship Phase 21 proactive alerts.
+- FRIDAY warns you about things without being asked.
+- Calendar reminders: "Sir, you have a meeting in 15 minutes."
+- Weather alerts: "Heads up — rain expected this afternoon."
+- System alerts: "Your battery is at 10%."
+- Runs on a background polling loop, speaks only when actionable.
+- Requires careful UX — must never be annoying or interrupt active conversations.
+
+25. Ship Phase 22 multi-step routines.
+- "Goodnight" → dims lights, locks doors, sets alarm, reads tomorrow's schedule.
+- "I'm heading home" → preheats house, turns on lights, starts playlist.
+- User-definable routines stored in memory or a `routines.json` config.
+- Depends on: home bridge, timers, calendar — build those first.
+
+26. Ship Phase 23 phone calls (Spix / telephony).
+- "Call the restaurant and make a reservation."
+- Spix MCP: real phone number, voice calls with ~500ms latency, 26 tools.
+- High complexity — needs conversation scripting, error handling, fallback.
+- Peak JARVIS feature but depends on external service + subscription.
+
+27. Ship Phase 24 Tesla / IoT control.
+- "Preheat the car" / "Is the car locked?" / "Start the Roomba."
+- TeslaMate MCP for Tesla (29 tools: climate, charging, locks, sentry).
+- iRobot via Home Assistant integration or direct `dorita980` API for Roombas.
+- Requires vehicle/device ownership + API credentials.
+
+28. Ship Phase 25 browser automation (Playwright).
+- "Book that restaurant on OpenTable" / "Order my usual from DoorDash."
+- Playwright MCP for full browser control with existing logins.
+- High capability but brittle — sites change, CAPTCHAs, anti-bot.
+- Task-mode only — never fast path.
+
+29. Ship Phase 26 multi-device support.
+- FRIDAY accessible from phone, tablet, car, any room.
+- Split-brain architecture: server (NUC/cloud) + thin clients per device.
+- LiveKit already supports multi-device audio rooms.
+- Device-tagged context for location-aware tool routing.
+- Depends on: remote bridge (Phase 10), home bridge, stable server deployment.
+
+30. Improve hardware only after the software path feels solid.
 - Use better mics for real-world reliability.
 - Do not treat Google Home devices as the hearing layer.
 
-16. Add observability and polish.
+31. Add observability and polish.
 - Keep audit logs useful.
 - Add task status visibility.
-- Preserve the "Jarvis" feel: quick acknowledgments, short spoken updates, minimal dead air.
+- Preserve the "FRIDAY" feel: quick acknowledgments, short spoken updates, minimal dead air.
 
 ---
 
@@ -723,20 +814,40 @@ Only after base responsiveness is good. Memory should improve continuity, not ad
 
 ## Skill priority, revised
 
-This list is about what should feel best in the product, not just what is technically easy.
+Ordered by implementation ease (simplest first), grouped by status.
 
+### Done
 1. App launcher
 2. File read
-3. Home bridge
-4. Spotify
-5. Calendar
-6. Gmail
-7. Claude delegation
-8. File write and move
-9. WhatsApp Web
-10. Shell
-11. Phone bridge
-12. Memory
+3. Spotify (basic playback + search)
+4. Calendar (read + write + update + delete)
+5. Gmail (read)
+6. Claude delegation (headless + visible terminal)
+7. File write, move, delete
+8. Memory (basic JSON)
+9. Domain-based tool routing
+
+### Next up (easiest to hardest)
+10. Weather — free API, no auth, fast path, ~30 min
+11. Unit conversion / math / translation — mostly LLM-native, optional tool, ~15 min
+12. Clipboard — `win32clipboard`, read/write, ~30 min
+13. System monitoring — `psutil`, fast path, ~45 min
+14. Timers and alarms — async timers + chime callback, ~2 hrs
+15. Reminders — scheduled callbacks + optional Google Tasks sync, ~2 hrs
+16. Screenshot / screen reading — `ImageGrab` + Gemini vision, ~1 hr
+17. Shell with confirmation — allowlists + task mode, ~3 hrs
+18. Maps / navigation — Google Maps API, needs key, ~2 hrs
+19. WhatsApp Web — browser automation, brittle, ~4 hrs
+20. Remote bridge (Telegram/Discord/LAN) — reuse tool surface, ~4 hrs
+21. Package tracking — Gmail search + carrier APIs, multi-step, ~4 hrs
+22. Proactive alerts — background polling loop, careful UX, ~6 hrs
+23. Multi-step routines — depends on home bridge + timers, ~4 hrs
+24. Home bridge (Home Assistant) — needs HA hardware, ~4 hrs
+25. Phone calls (Spix) — external service, conversation scripting, ~8 hrs
+26. Tesla / IoT / Roomba — needs devices + credentials, ~4 hrs
+27. Browser automation (Playwright) — powerful but brittle, ~8 hrs
+28. Multi-device support — split-brain architecture, ~weeks
+29. Semantic memory upgrade — vector search, decay scoring, ~6 hrs
 
 ---
 
