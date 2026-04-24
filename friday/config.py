@@ -13,7 +13,7 @@ load_dotenv()
 # Providers & Models
 # ---------------------------------------------------------------------------
 
-STT_PROVIDER       = "sarvam"
+STT_PROVIDER       = "groq"
 LLM_PROVIDER       = "gemini"
 TTS_PROVIDER       = "google"
 

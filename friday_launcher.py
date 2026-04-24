@@ -412,18 +412,8 @@ def _ensure_boot_ack_clip() -> bool:
 
 
 def play_activation_ack():
-    """Play the immediate local wake acknowledgement, falling back to the chime."""
-
-    def _play():
-        if _ensure_boot_ack_clip():
-            try:
-                winsound.PlaySound(str(BOOT_ACK_PATH), winsound.SND_FILENAME)
-                return
-            except Exception as e:
-                logger.warning("Could not play wake acknowledgement clip: %s", e)
-        play_chime()
-
-    threading.Thread(target=_play, daemon=True).start()
+    """Play the immediate local wake acknowledgement."""
+    play_chime()
 
 
 # ---------------------------------------------------------------------------

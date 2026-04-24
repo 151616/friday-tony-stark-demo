@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import sys
 from pathlib import Path
 
@@ -40,7 +41,9 @@ class LocalDomainToolPool:
         ordered_domains = list(dict.fromkeys(domains))
         toolsets = [self.get_toolset(domain) for domain in ordered_domains]
         for toolset in toolsets:
-            await toolset.setup()
+            # Shield to prevent agent cancellation (e.g. from user interruption) from cancelling
+            # the underlying MCP initialization, which would crash the MCP subprocess due to an SDK bug.
+            await asyncio.shield(toolset.setup())
         return toolsets
 
     async def aclose(self) -> None:

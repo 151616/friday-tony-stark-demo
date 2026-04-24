@@ -352,3 +352,8 @@ def register(mcp):
         installed something and Friday says it can't find it, or asks Friday
         to "refresh apps" / "rescan apps"."""
         return rescan_apps()
+
+# Pre-warm the discovery cache in the background when the module loads,
+# so that the 3-5 second PowerShell scan is finished before the user
+# ever asks to open an app.
+threading.Thread(target=_ensure_discovered, daemon=True).start()

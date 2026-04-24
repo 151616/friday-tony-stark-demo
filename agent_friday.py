@@ -132,9 +132,9 @@ class FridayAgent(Agent):
             vad=vad or silero.VAD.load(
                 # Bumped from 0.92 / 0.5 to filter out background chatter,
                 # typing, distant voices, brief noises during a session.
-                activation_threshold=0.95,
-                min_speech_duration=0.7,
-                min_silence_duration=0.8,
+                activation_threshold=0.6,
+                min_speech_duration=0.1,
+                min_silence_duration=0.5,
             ),
         )
 
@@ -362,6 +362,9 @@ async def entrypoint(ctx: JobContext) -> None:
     tool_pool = LocalDomainToolPool(repo_root=_REPO_ROOT)
     core_toolset = tool_pool.get_toolset("core")
     logger.info("Domain tool pool prepared (%s)", _REPO_ROOT / "server.py")
+
+    # Pre-warm the core toolset in the background so the first tool call is instant
+    asyncio.create_task(core_toolset.setup())
 
     session = AgentSession(
         turn_handling=TurnHandlingOptions(

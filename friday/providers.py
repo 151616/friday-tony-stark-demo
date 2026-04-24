@@ -40,6 +40,27 @@ def build_stt(http_session=None):
     elif STT_PROVIDER == "whisper":
         logger.info("STT → OpenAI Whisper")
         return lk_openai.STT(model="whisper-1")
+    elif STT_PROVIDER == "google":
+        logger.info("STT → Google Speech-to-Text")
+        sa_file = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+        kwargs = {}
+        if sa_file:
+            import json
+            sa_path = Path(__file__).parents[1] / sa_file
+            if sa_path.exists():
+                with open(sa_path) as f:
+                    kwargs["credentials_info"] = json.load(f)
+        return lk_google.STT(**kwargs)
+    elif STT_PROVIDER == "deepgram":
+        logger.info("STT → Deepgram")
+        return lk_deepgram.STT()
+    elif STT_PROVIDER == "groq":
+        logger.info("STT → Groq Whisper (Free Tier)")
+        return lk_openai.STT(
+            model="whisper-large-v3-turbo",
+            api_key=os.getenv("GROQ_API_KEY"),
+            base_url="https://api.groq.com/openai/v1",
+        )
     else:
         raise ValueError(f"Unknown STT_PROVIDER: {STT_PROVIDER!r}")
 
